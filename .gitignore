@@ -1,0 +1,14 @@
+secrets.env
+__pycache__/
+*.pyc
+
+# runtime state（keeper 的 WORKDIR 產物；絕不入庫）
+cookies.txt
+cookies-student.txt
+token.json
+state.json
+control.json
+rollcall.json
+apikeys.json
+tokens-*.jsonl.gz
+*.tmp

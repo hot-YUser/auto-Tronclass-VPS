@@ -1,0 +1,18 @@
+[Unit]
+Description=TronClass QR data read-only API (decoupled from keeper)
+After=network-online.target qr-keeper.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/qr-harvest
+EnvironmentFile=/etc/qr-harvest/secrets.env
+ExecStart=/usr/bin/python3 /home/opc/qr-harvest/qr_api.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

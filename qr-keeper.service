@@ -1,0 +1,18 @@
+[Unit]
+Description=TronClass QR keeper (session + rollcall + token harvest)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/qr-harvest
+EnvironmentFile=/etc/qr-harvest/secrets.env
+ExecStart=/usr/bin/python3 /home/opc/qr-harvest/qr_keeper.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
