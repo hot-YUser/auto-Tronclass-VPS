@@ -12,3 +12,6 @@ rollcall.json
 apikeys.json
 tokens-*.jsonl.gz
 *.tmp
+
+# Claude Memory（本專案記憶備份，絕不入庫）
+Claude Memory/
