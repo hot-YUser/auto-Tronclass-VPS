@@ -26,8 +26,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from qr_common import ConfigError, TOKEN_RE, env_choice, env_float, env_int, env_text
+from qr_common import ConfigError, env_choice, env_float, env_int, env_text
 from qr_common import env_utc_date, validate_token_record
+from qr_common import write_json_atomic as _write_json_atomic
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,10 @@ class KeeperConfig:
     socket_timeout_seconds: float
 
 
+class AuthenticationLost(RuntimeError):
+    """The teacher session is no longer authenticated."""
+
+
 def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
     values = os.environ if env is None else env
     base = env_text(values, "QR_BASE", "https://www.tronclass.com.tw", required=True).rstrip("/")
@@ -56,9 +61,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
     if parsed.scheme not in ("http", "https") or not parsed.hostname \
             or parsed.username is not None or parsed.password is not None:
         raise ConfigError("QR_BASE must be an http(s) origin without credentials")
-    course_id = env_text(values, "QR_COURSE_ID", required=True)
-    if not course_id.isdigit() or int(course_id) <= 0:
-        raise ConfigError("QR_COURSE_ID must be a positive integer")
+    course_id = str(env_int(values, "QR_COURSE_ID", 0, minimum=1))
     preserve_mode = env_choice(
         values, "QR_PRESERVE_MODE", "auto", ("on", "off", "auto"))
     preserve_after = env_utc_date(
@@ -196,13 +199,6 @@ def _http_error_summary(exc):
     return type(exc).__name__
 
 
-def _write_json_atomic(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
 def _read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -299,7 +295,7 @@ def login(user, passwd, jar):
     req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
     op.open(req).read()
     if not session_valid(op):
-        raise RuntimeError("login validation failed")
+        raise AuthenticationLost("login validation failed")
     return op
 
 
@@ -416,11 +412,15 @@ def _load_rid():
     return str((rec or {}).get("rollcall_id") or "") if isinstance(rec, dict) else ""
 
 
-def _write_token(data, ts, rid, now_ms=None):
+def _write_token(data, rid, now_ms=None):
+    try:
+        timestamp = int(data[:10]) if isinstance(data, str) else None
+    except ValueError:
+        timestamp = None
     record = {
         "ok": True,
         "data": data,
-        "ts": ts,
+        "ts": timestamp,
         "fetched_at_utc": _now_utc(),
         "rollcall_id": rid,
     }
@@ -428,8 +428,8 @@ def _write_token(data, ts, rid, now_ms=None):
         record, _utc_ms() if now_ms is None else now_ms, STALE_MS, FUTURE_SKEW_MS)
     if not checked.valid:
         raise RuntimeError("token rejected: {}".format(checked.error))
-    _write_json_atomic(TOKEN_PATH, record)
-    return checked.age_ms
+    _write_json_atomic(TOKEN_PATH, record, ensure_ascii=False)
+    return checked
 
 
 def _control_nonce():
@@ -540,12 +540,12 @@ def harvester():
                 status, body = _json_req(
                     op, BASE + "/api/course/{}/rollcall/{}/qr_code".format(COURSE_ID, rid))
                 data = str((body or {}).get("data") or "") if isinstance(body, dict) else ""
-                if status != 200 or TOKEN_RE.fullmatch(data) is None:
+                if status != 200:
                     raise RuntimeError("qr_code invalid response (HTTP {})".format(status))
-                ts = int(data[:10])
-                age_ms = _write_token(data, ts, rid)
+                checked = _write_token(data, rid)
+                ts = checked.timestamp
                 with LOCK:
-                    STATE.update(last_fetch_utc=_now_utc(), age_ms=age_ms,
+                    STATE.update(last_fetch_utc=_now_utc(), age_ms=checked.age_ms,
                                  rollcall_id=rid, ok=True, last_error="")
                 corpus.write(json.dumps(
                     {"utc": _now_utc(), "ts": ts, "data": data}, separators=(",", ":")))
@@ -569,7 +569,7 @@ def harvester():
                     msg, backoff, preserve), flush=True)
                 auth_loss = (isinstance(exc, urllib.error.HTTPError)
                              and exc.code in (401, 403)) \
-                    or "login validation failed" in msg
+                    or isinstance(exc, AuthenticationLost)
                 if auth_loss:
                     op = None
                     rid = ""
@@ -602,9 +602,7 @@ def passive_check():
 def state_writer():
     while not STOP_EVENT.is_set():
         try:
-            state = _get()
-            state.pop("last_data", None)
-            _write_json_atomic(STATE_PATH, state)
+            _write_json_atomic(STATE_PATH, _get(), ensure_ascii=False)
         except OSError as exc:
             print("state write error: {}".format(type(exc).__name__), flush=True)
         STOP_EVENT.wait(STATE_WRITE_SECONDS)

@@ -112,22 +112,24 @@ class KeeperTokenTests(unittest.TestCase):
 
     def test_keeper_validates_before_atomic_write(self):
         data = "2000000000" + "a" * 32
-        age = qr_keeper._write_token(
-            data, 2_000_000_000, "r1", now_ms=2_000_000_000_500)
-        self.assertEqual(500, age)
+        checked = qr_keeper._write_token(
+            data, "r1", now_ms=2_000_000_000_500)
+        self.assertEqual(500, checked.age_ms)
+        self.assertEqual(2_000_000_000, checked.timestamp)
         record = json.loads(pathlib.Path(qr_keeper.TOKEN_PATH).read_text(encoding="utf-8"))
         self.assertEqual(data, record["data"])
         self.assertEqual(2_000_000_000, record["ts"])
 
-    def test_keeper_rejects_stale_future_and_mismatched_records(self):
+    def test_keeper_rejects_stale_future_and_bad_shape(self):
         cases = (
-            ("2000000000" + "a" * 32, 2_000_000_000, 2_000_000_000_501),
-            ("2000000001" + "b" * 32, 2_000_000_001, 2_000_000_000_499),
-            ("2000000000" + "c" * 32, 2_000_000_001, 2_000_000_000_500),
+            ("2000000000" + "a" * 32, 2_000_000_000_501),
+            ("2000000001" + "b" * 32, 2_000_000_000_499),
+            ("2000000000" + "C" * 32, 2_000_000_000_500),
+            ("not-a-token", 2_000_000_000_500),
         )
-        for data, ts, now_ms in cases:
-            with self.subTest(data=data, ts=ts), self.assertRaises(RuntimeError):
-                qr_keeper._write_token(data, ts, "r1", now_ms=now_ms)
+        for data, now_ms in cases:
+            with self.subTest(data=data), self.assertRaises(RuntimeError):
+                qr_keeper._write_token(data, "r1", now_ms=now_ms)
         self.assertFalse(pathlib.Path(qr_keeper.TOKEN_PATH).exists())
 
     def test_corpus_close_flushes_and_closes(self):

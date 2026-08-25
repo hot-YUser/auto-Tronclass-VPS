@@ -1,3 +1,4 @@
+import functools
 import pathlib
 import subprocess
 import unittest
@@ -6,11 +7,12 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+@functools.lru_cache(maxsize=1)
 def tracked_files():
     output = subprocess.check_output(
         ["git", "ls-files", "-z"], cwd=str(ROOT))
-    return [pathlib.PurePosixPath(p.decode("utf-8"))
-            for p in output.split(b"\0") if p]
+    return tuple(pathlib.PurePosixPath(p.decode("utf-8"))
+                 for p in output.split(b"\0") if p)
 
 
 def env_names(name):

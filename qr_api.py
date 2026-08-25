@@ -20,7 +20,8 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Callable, Mapping, Optional
 
-from qr_common import ConfigError, env_float, env_int, env_text, validate_token_record
+from qr_common import ConfigError, env_float, env_int, env_text
+from qr_common import validate_token_record, write_json_atomic
 
 
 SECURITY_HEADERS = (
@@ -104,13 +105,6 @@ def _read_json(path):
             return json.load(f)
     except (OSError, TypeError, ValueError):
         return None
-
-
-def _write_json_atomic(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, separators=(",", ":"))
-    os.replace(tmp, path)
 
 
 @dataclass
@@ -277,8 +271,9 @@ class ApiApplication:
 
     def write_restart(self):
         nonce = str(self.now_ms())
-        _write_json_atomic(
-            self.control_path, {"cmd": "restart", "nonce": nonce})
+        write_json_atomic(
+            self.control_path, {"cmd": "restart", "nonce": nonce},
+            separators=(",", ":"))
         return nonce
 
     def log_access(self, handler, status, duration_ms, response_bytes):
@@ -359,17 +354,24 @@ class Handler(BaseHTTPRequestHandler):
             return ""
         return token
 
-    def _send(self, status, obj, extra_headers=None, head_only=False):
-        body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    def _send_headers(self, status, content_length, extra_headers=None,
+                      content_type=None):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        if content_type is not None:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(content_length))
         self.send_header("Connection", "close")
         for name, value in SECURITY_HEADERS:
             self.send_header(name, value)
         for name, value in extra_headers or ():
             self.send_header(name, value)
         self.end_headers()
+
+    def _send(self, status, obj, extra_headers=None, head_only=False):
+        body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_headers(
+            status, len(body), extra_headers,
+            content_type="application/json; charset=utf-8")
         if not head_only:
             try:
                 self.wfile.write(body)
@@ -378,14 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._access_bytes = 0
 
     def _send_empty(self, status, extra_headers=None):
-        self.send_response(status)
-        self.send_header("Content-Length", "0")
-        self.send_header("Connection", "close")
-        for name, value in SECURITY_HEADERS:
-            self.send_header(name, value)
-        for name, value in extra_headers or ():
-            self.send_header(name, value)
-        self.end_headers()
+        self._send_headers(status, 0, extra_headers)
 
     def send_error(self, code, message=None, explain=None):
         del message, explain
@@ -609,6 +604,7 @@ class BoundedHTTPServer(HTTPServer):
         lines.extend("{}: {}".format(name, value) for name, value in SECURITY_HEADERS)
         response = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
         try:
+            request.settimeout(min(self.socket_timeout, 0.05))
             request.sendall(response)
         except OSError:
             pass

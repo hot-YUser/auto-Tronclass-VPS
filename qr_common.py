@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime
+import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Mapping, Optional
@@ -108,12 +110,24 @@ def env_utc_date(env: Mapping[str, str], name: str,
     return value
 
 
+def write_json_atomic(path, obj, **dump_options) -> None:
+    """Write one JSON document via same-directory atomic replacement."""
+    path = os.fspath(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(obj, handle, **dump_options)
+    os.replace(tmp, path)
+
+
 @dataclass(frozen=True)
 class TokenValidation:
-    valid: bool
     error: str
     age_ms: Optional[int]
     timestamp: Optional[int]
+
+    @property
+    def valid(self) -> bool:
+        return not self.error
 
 
 def validate_token_record(record, now_ms: int, stale_ms: int,
@@ -122,19 +136,19 @@ def validate_token_record(record, now_ms: int, stale_ms: int,
     if stale_ms < 0 or future_skew_ms < 0:
         raise ValueError("token age bounds must be non-negative")
     if not isinstance(record, dict) or record.get("ok") is not True:
-        return TokenValidation(False, "invalid", None, None)
+        return TokenValidation("invalid", None, None)
     data = record.get("data")
     if not isinstance(data, str) or TOKEN_RE.fullmatch(data) is None:
-        return TokenValidation(False, "shape", None, None)
+        return TokenValidation("shape", None, None)
     timestamp = record.get("ts")
     if isinstance(timestamp, bool) or not isinstance(timestamp, int):
-        return TokenValidation(False, "timestamp", None, None)
+        return TokenValidation("timestamp", None, None)
     embedded = int(data[:10])
     if embedded != timestamp:
-        return TokenValidation(False, "timestamp_mismatch", None, timestamp)
+        return TokenValidation("timestamp_mismatch", None, timestamp)
     age_ms = int(now_ms) - timestamp * 1000
     if age_ms > stale_ms:
-        return TokenValidation(False, "stale", age_ms, timestamp)
+        return TokenValidation("stale", age_ms, timestamp)
     if age_ms < -future_skew_ms:
-        return TokenValidation(False, "future", age_ms, timestamp)
-    return TokenValidation(True, "", age_ms, timestamp)
+        return TokenValidation("future", age_ms, timestamp)
+    return TokenValidation("", age_ms, timestamp)

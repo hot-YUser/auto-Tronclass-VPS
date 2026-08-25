@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import secrets
 import time
 
-from qr_common import ConfigError, env_text
+from qr_common import ConfigError, env_float, env_text, write_json_atomic
 
 
 WORKDIR = "/home/opc/qr-harvest"
@@ -45,10 +44,8 @@ def _load():
 
 
 def _save(keys):
-    tmp = KEYS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"keys": keys}, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, KEYS_PATH)
+    write_json_atomic(
+        KEYS_PATH, {"keys": keys}, ensure_ascii=False, indent=1)
 
 
 def _hash(key):
@@ -69,12 +66,12 @@ def _status(record):
 
 def positive_days(value):
     try:
-        days = float(value)
-    except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError("must be a number")
-    if not math.isfinite(days) or days <= 0:
-        raise argparse.ArgumentTypeError("must be a positive finite number")
-    return days
+        return env_float(
+            {"TTL_DAYS": str(value)}, "TTL_DAYS", 1.0,
+            minimum=0.0, minimum_exclusive=True)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be a positive finite number") from exc
 
 
 def cmd_create(args):
