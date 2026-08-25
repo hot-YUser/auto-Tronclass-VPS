@@ -13,6 +13,15 @@ def tracked_files():
             for p in output.split(b"\0") if p]
 
 
+def env_names(name):
+    names = set()
+    for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            names.add(stripped.split("=", 1)[0])
+    return names
+
+
 class RepositoryHygieneTests(unittest.TestCase):
     def test_runtime_secrets_and_private_memory_are_not_tracked(self):
         paths = tracked_files()
@@ -26,7 +35,14 @@ class RepositoryHygieneTests(unittest.TestCase):
             self.assertNotIn("Claude Memory/", text)
             self.assertNotIn("__pycache__/", text)
             self.assertNotEqual(".pyc", path.suffix, text)
-            self.assertFalse(path.name.startswith("tokens-") and path.name.endswith(".jsonl.gz"), text)
+            self.assertFalse(
+                path.name.startswith("tokens-") and path.name.endswith(".jsonl.gz"), text)
+
+    def test_public_tree_contains_no_retired_combined_environment_example(self):
+        names = {path.as_posix() for path in tracked_files()}
+        self.assertNotIn("secrets.env.example", names)
+        self.assertIn("api.env.example", names)
+        self.assertIn("keeper.env.example", names)
 
     def test_tracked_text_uses_lf(self):
         for relative in tracked_files():
@@ -42,14 +58,41 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assertIn("GNU AFFERO GENERAL PUBLIC LICENSE", license_text)
         self.assertIn("Version 3, 19 November 2007", license_text)
 
-    def test_systemd_units_use_explicit_startup_paths(self):
-        for name in ("qr-api.service", "qr-keeper.service"):
+    def test_environment_examples_separate_service_secrets(self):
+        api = env_names("api.env.example")
+        keeper = env_names("keeper.env.example")
+        self.assertIn("QR_API_KEY", api)
+        self.assertTrue({"QR_TEACHER_USER", "QR_TEACHER_PASS"}.issubset(keeper))
+        self.assertTrue(api.isdisjoint({"QR_TEACHER_USER", "QR_TEACHER_PASS"}))
+        self.assertTrue(keeper.isdisjoint({
+            "QR_API_KEY", "QR_BIND", "QR_PORT", "QR_API_WORKERS",
+            "QR_API_PENDING", "QR_GLOBAL_RATE", "QR_PRINCIPAL_RATE",
+        }))
+        self.assertFalse(any(name.startswith("QR_STUDENT_") for name in api | keeper))
+
+    def test_systemd_units_are_separate_explicit_and_hardened(self):
+        expected_env = {
+            "qr-api.service": "/etc/qr-harvest/api.env",
+            "qr-keeper.service": "/etc/qr-harvest/keeper.env",
+        }
+        required = (
+            "UMask=0077",
+            "NoNewPrivileges=true",
+            "TasksMax=64",
+            "MemoryMax=256M",
+            "LimitNOFILE=1024",
+            "TimeoutStopSec=30",
+        )
+        for name, environment_file in expected_env.items():
             text = (ROOT / name).read_text(encoding="utf-8")
             with self.subTest(unit=name):
-                self.assertIn("WorkingDirectory=/", text)
-                self.assertIn("EnvironmentFile=/", text)
-                self.assertIn("ExecStart=/usr/bin/python3 /", text)
+                self.assertIn("User=opc", text)
+                self.assertIn("WorkingDirectory=/home/opc/qr-harvest", text)
+                self.assertIn("EnvironmentFile={}".format(environment_file), text)
+                self.assertIn("ExecStart=/usr/bin/python3 /home/opc/qr-harvest/", text)
                 self.assertNotIn("/bin/sh", text)
+                for directive in required:
+                    self.assertIn(directive, text)
 
 
 if __name__ == "__main__":

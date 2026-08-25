@@ -1,4 +1,6 @@
 secrets.env
+api.env
+keeper.env
 __pycache__/
 *.pyc
 

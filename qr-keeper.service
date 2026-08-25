@@ -1,5 +1,5 @@
 [Unit]
-Description=TronClass QR keeper (session + rollcall + token harvest)
+Description=TronClass QR keeper (teacher session + rollcall + token harvest)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,8 +7,15 @@ Wants=network-online.target
 Type=simple
 User=opc
 WorkingDirectory=/home/opc/qr-harvest
-EnvironmentFile=/etc/qr-harvest/secrets.env
+EnvironmentFile=/etc/qr-harvest/keeper.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/opc/qr-harvest/qr_keeper.py
+UMask=0077
+NoNewPrivileges=true
+TasksMax=64
+MemoryMax=256M
+LimitNOFILE=1024
+TimeoutStopSec=30
 Restart=always
 RestartSec=10
 StandardOutput=journal
