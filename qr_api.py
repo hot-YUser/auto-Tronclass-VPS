@@ -1,145 +1,657 @@
 #!/usr/bin/env python3
-"""TronClass QR data 唯讀 API（純 stdlib，Python 3.7+）。
-
-與 keeper 解耦：只讀 keeper 寫在 WORKDIR 的 token.json / state.json，本進程不持有任何
-session/cookie，可自由重啟、升級而不中斷 keeper。/token 需帶有效受管 API Key（由 qr_keys.py
-建立、存 apikeys.json、每把獨立 TTL、可即時撤銷）；本進程每次請求重讀 apikeys.json，故新建/
-撤銷即時生效、免重啟。master key（QR_API_KEY，選用）為 admin，可用於 /token 與 /restart。
-
-端點：
-- GET  /health   健康面（無驗證；state.json + 即時 token_age_ms，不含 token 本體）
-- GET  /token    最新 data token（Authorization: Bearer <有效 API Key>；過期回 503）
-- POST /restart  請 keeper 重建點名（Bearer <master key>；寫 control.json）
-
-預設綁 127.0.0.1。
-"""
+"""Bounded read-only HTTP API for validated QR token records."""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import math
 import os
+import queue
+import re
+import signal
+import socket
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
+from collections import OrderedDict
+from dataclasses import dataclass
+from email.utils import formatdate
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Callable, Mapping, Optional
 
-API_KEY = os.environ.get("QR_API_KEY", "")  # master/admin key（選用）
-BIND = os.environ.get("QR_BIND", "127.0.0.1")
-PORT = int(os.environ.get("QR_PORT", "8741"))
-STALE_MS = int(os.environ.get("QR_STALE_MS", "3000"))
-WORKDIR = os.environ.get("QR_WORKDIR", "/home/opc/qr-harvest")
-
-TOKEN_PATH = os.path.join(WORKDIR, "token.json")
-STATE_PATH = os.path.join(WORKDIR, "state.json")
-CONTROL_PATH = os.path.join(WORKDIR, "control.json")
-KEYS_PATH = os.path.join(WORKDIR, "apikeys.json")
+from qr_common import ConfigError, env_float, env_int, env_text, validate_token_record
 
 
-def _utc_ms():
-    return int(time.time() * 1000)
+SECURITY_HEADERS = (
+    ("Cache-Control", "no-store"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Permissions-Policy", "accelerometer=(), autoplay=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()"),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Vary", "Authorization"),
+)
+ROUTE_ALLOW = {
+    "/health": "GET, HEAD, OPTIONS",
+    "/token": "GET, HEAD, OPTIONS",
+    "/restart": "POST, OPTIONS",
+}
+_SAFE_METHOD = re.compile(r"[A-Z]{1,12}\Z")
+
+
+@dataclass(frozen=True)
+class ApiConfig:
+    api_key: str
+    bind: str
+    port: int
+    stale_ms: int
+    future_skew_ms: int
+    workdir: str
+    workers: int
+    pending: int
+    socket_timeout_seconds: float
+    limiter_max_entries: int
+    global_rate: float
+    global_burst: int
+    principal_rate: float
+    principal_burst: int
+    health_rate: float
+    health_burst: int
+    restart_rate: float
+    restart_burst: int
+
+
+def load_config(env: Optional[Mapping[str, str]] = None) -> ApiConfig:
+    values = os.environ if env is None else env
+    bind = env_text(values, "QR_BIND", "127.0.0.1", required=True)
+    if any(char.isspace() for char in bind):
+        raise ConfigError("QR_BIND must not contain whitespace")
+    return ApiConfig(
+        api_key=env_text(values, "QR_API_KEY", default=""),
+        bind=bind,
+        port=env_int(values, "QR_PORT", 8741, minimum=1, maximum=65535),
+        stale_ms=env_int(values, "QR_STALE_MS", 3000, minimum=1),
+        future_skew_ms=env_int(values, "QR_FUTURE_SKEW_MS", 1000, minimum=0),
+        workdir=env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True),
+        workers=env_int(values, "QR_API_WORKERS", 4, minimum=1, maximum=64),
+        pending=env_int(values, "QR_API_PENDING", 16, minimum=1, maximum=1024),
+        socket_timeout_seconds=env_float(
+            values, "QR_SOCKET_TIMEOUT_SECONDS", 10.0,
+            minimum=0.0, minimum_exclusive=True, maximum=300.0),
+        limiter_max_entries=env_int(
+            values, "QR_LIMITER_MAX_ENTRIES", 1024, minimum=1, maximum=65536),
+        global_rate=env_float(
+            values, "QR_GLOBAL_RATE", 20.0, minimum=0.0, minimum_exclusive=True),
+        global_burst=env_int(values, "QR_GLOBAL_BURST", 40, minimum=1),
+        principal_rate=env_float(
+            values, "QR_PRINCIPAL_RATE", 2.0, minimum=0.0, minimum_exclusive=True),
+        principal_burst=env_int(values, "QR_PRINCIPAL_BURST", 4, minimum=1),
+        health_rate=env_float(
+            values, "QR_HEALTH_RATE", 5.0, minimum=0.0, minimum_exclusive=True),
+        health_burst=env_int(values, "QR_HEALTH_BURST", 10, minimum=1),
+        restart_rate=env_float(
+            values, "QR_RESTART_RATE", 1.0 / 60.0,
+            minimum=0.0, minimum_exclusive=True),
+        restart_burst=env_int(values, "QR_RESTART_BURST", 1, minimum=1),
+    )
 
 
 def _read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return None
 
 
-def _token_age_ms(tok):
-    if isinstance(tok, dict) and tok.get("ts"):
-        try:
-            return _utc_ms() - int(tok["ts"]) * 1000
-        except Exception:
-            return None
-    return None
+def _write_json_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, separators=(",", ":"))
+    os.replace(tmp, path)
 
 
-def _bearer(handler):
-    auth = handler.headers.get("Authorization", "")
-    return auth[7:] if auth.startswith("Bearer ") else ""
+@dataclass
+class _BucketState:
+    tokens: float
+    updated: float
 
 
-def _is_master(token):
-    return bool(API_KEY) and hmac.compare_digest(token.encode(), API_KEY.encode())
+class TokenBucketTable:
+    """Thread-safe monotonic token buckets with bounded LRU state."""
+
+    def __init__(self, rate: float, burst: int, max_entries: int,
+                 clock: Callable[[], float] = time.monotonic):
+        if rate <= 0 or burst < 1 or max_entries < 1:
+            raise ValueError("invalid token bucket bounds")
+        self.rate = float(rate)
+        self.burst = float(burst)
+        self.max_entries = int(max_entries)
+        self.clock = clock
+        self._states = OrderedDict()
+        self._lock = threading.Lock()
+
+    @property
+    def size(self):
+        with self._lock:
+            return len(self._states)
+
+    def consume(self, key: str):
+        now = float(self.clock())
+        with self._lock:
+            state = self._states.pop(key, None)
+            if state is None:
+                if len(self._states) >= self.max_entries:
+                    self._states.popitem(last=False)
+                state = _BucketState(self.burst, now)
+            elapsed = max(0.0, now - state.updated)
+            state.tokens = min(self.burst, state.tokens + elapsed * self.rate)
+            state.updated = now
+            if state.tokens >= 1.0:
+                state.tokens -= 1.0
+                allowed = True
+                retry_after = 0.0
+            else:
+                allowed = False
+                retry_after = (1.0 - state.tokens) / self.rate
+            self._states[key] = state
+            return allowed, retry_after
 
 
-def _is_valid_managed_key(token):
-    """每次請求重讀 apikeys.json：撤銷/新建即時生效。有效＝雜湊命中且未撤銷且未過期。"""
-    if not token:
+class RequestLimiter:
+    def __init__(self, config: ApiConfig,
+                 clock: Callable[[], float] = time.monotonic):
+        self.global_table = TokenBucketTable(
+            config.global_rate, config.global_burst, 1, clock)
+        self.principal_table = TokenBucketTable(
+            config.principal_rate, config.principal_burst,
+            config.limiter_max_entries, clock)
+        self.health_table = TokenBucketTable(
+            config.health_rate, config.health_burst, 1, clock)
+        self.restart_table = TokenBucketTable(
+            config.restart_rate, config.restart_burst, 1, clock)
+
+    def check(self, path: str, principal: str):
+        checks = [(self.global_table, "global")]
+        if path == "/health":
+            checks.append((self.health_table, "health"))
+        elif path in ("/token", "/restart"):
+            checks.append((self.principal_table, principal))
+        if path == "/restart":
+            checks.append((self.restart_table, "restart"))
+        for table, key in checks:
+            allowed, retry_after = table.consume(key)
+            if not allowed:
+                return False, retry_after
+        return True, 0.0
+
+
+class ApiApplication:
+    def __init__(self, config: ApiConfig,
+                 wall_clock: Callable[[], float] = time.time,
+                 monotonic: Callable[[], float] = time.monotonic,
+                 log_sink=None):
+        self.config = config
+        self.wall_clock = wall_clock
+        self.monotonic = monotonic
+        self.log_sink = log_sink or self._print_log
+        self.token_path = os.path.join(config.workdir, "token.json")
+        self.state_path = os.path.join(config.workdir, "state.json")
+        self.control_path = os.path.join(config.workdir, "control.json")
+        self.keys_path = os.path.join(config.workdir, "apikeys.json")
+        self.limiter = RequestLimiter(config, monotonic)
+
+    @staticmethod
+    def _print_log(entry):
+        print(json.dumps(entry, ensure_ascii=True, separators=(",", ":"),
+                         sort_keys=True), flush=True)
+
+    def now_ms(self):
+        return int(self.wall_clock() * 1000)
+
+    def principal(self, token: str, remote: str):
+        if token:
+            return "auth:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return "ip:" + remote
+
+    def is_master(self, token: str):
+        return bool(self.config.api_key) and hmac.compare_digest(
+            token.encode("utf-8"), self.config.api_key.encode("utf-8"))
+
+    def is_managed(self, token: str):
+        if not token:
+            return False
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        data = _read_json(self.keys_path)
+        keys = data.get("keys", []) if isinstance(data, dict) else []
+        now = int(self.wall_clock())
+        for record in keys if isinstance(keys, list) else ():
+            if not isinstance(record, dict):
+                continue
+            stored = record.get("hash")
+            try:
+                expires = int(record.get("expires_epoch", 0))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(stored, str) and stored \
+                    and hmac.compare_digest(stored, digest) \
+                    and record.get("revoked") is False and now < expires:
+                return True
         return False
-    h = hashlib.sha256(token.encode()).hexdigest()
-    now = int(time.time())
-    d = _read_json(KEYS_PATH)
-    keys = d.get("keys", []) if isinstance(d, dict) else []
-    for k in keys:
-        kh = k.get("hash", "")
-        if kh and hmac.compare_digest(kh, h) and not k.get("revoked") \
-                and now < int(k.get("expires_epoch", 0)):
-            return True
-    return False
 
+    def token_authorized(self, token: str):
+        return self.is_master(token) or self.is_managed(token)
 
-def _authorized_token(handler):
-    tok = _bearer(handler)
-    return _is_master(tok) or _is_valid_managed_key(tok)
+    def health(self):
+        state = _read_json(self.state_path)
+        token = _read_json(self.token_path)
+        checked = validate_token_record(
+            token, self.now_ms(), self.config.stale_ms,
+            self.config.future_skew_ms)
+        ok = isinstance(state, dict) and state.get("ok") is True and checked.valid
+        payload = {
+            "ok": ok,
+            "status": "ok" if ok else "unhealthy",
+            "token_fresh": checked.valid,
+            "token_age_ms": checked.age_ms,
+        }
+        return (200 if ok else 503), payload
 
+    def token_payload(self):
+        token = _read_json(self.token_path)
+        checked = validate_token_record(
+            token, self.now_ms(), self.config.stale_ms,
+            self.config.future_skew_ms)
+        if not checked.valid:
+            if checked.error == "stale":
+                return 503, {"error": "stale", "age_ms": checked.age_ms}
+            return 503, {"error": "no_data"}
+        return 200, {
+            "ok": True,
+            "data": token["data"],
+            "fetched_at_utc": token.get("fetched_at_utc"),
+            "age_ms": checked.age_ms,
+        }
 
-def _authorized_admin(handler):
-    return _is_master(_bearer(handler))
+    def write_restart(self):
+        nonce = str(self.now_ms())
+        _write_json_atomic(
+            self.control_path, {"cmd": "restart", "nonce": nonce})
+        return nonce
+
+    def log_access(self, handler, status, duration_ms, response_bytes):
+        method = getattr(handler, "command", "") or ""
+        if _SAFE_METHOD.fullmatch(method) is None:
+            method = "OTHER"
+        raw_path = getattr(handler, "path", "") or ""
+        try:
+            parsed_path = urllib.parse.urlsplit(raw_path).path
+        except ValueError:
+            parsed_path = ""
+        path = parsed_path if parsed_path in ROUTE_ALLOW else "other"
+        remote = ""
+        if getattr(handler, "client_address", None):
+            remote = str(handler.client_address[0])
+        entry = {
+            "event": "http_access",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.wall_clock())),
+            "remote": remote,
+            "method": method,
+            "path": path,
+            "status": int(status or 0),
+            "duration_ms": max(0, int(duration_ms)),
+            "response_bytes": max(0, int(response_bytes)),
+        }
+        self.log_sink(entry)
+
+    def log_server_event(self, event, remote):
+        self.log_sink({
+            "event": event,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.wall_clock())),
+            "remote": str(remote or ""),
+        })
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
+    server_version = "qr-api"
+    sys_version = ""
 
-    def _send(self, status, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def version_string(self):
+        return "qr-api"
+
+    def log_message(self, fmt, *args):
+        del fmt, args
+
+    def log_request(self, code="-", size="-"):
+        del code, size
+
+    def handle_one_request(self):
+        self._access_started = self.server.app.monotonic()
+        self._access_status = 0
+        self._access_bytes = 0
+        try:
+            super().handle_one_request()
+        finally:
+            command = getattr(self, "command", "")
+            if command or self._access_status:
+                elapsed = (self.server.app.monotonic() - self._access_started) * 1000
+                self.server.app.log_access(
+                    self, self._access_status, elapsed, self._access_bytes)
+
+    def send_response(self, code, message=None):
+        self._access_status = int(code)
+        super().send_response(code, message)
+
+    def _path(self):
+        try:
+            return urllib.parse.urlsplit(self.path).path
+        except ValueError:
+            return ""
+
+    def _bearer(self):
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            return ""
+        token = authorization[7:]
+        if not token or token.strip() != token or any(char.isspace() for char in token):
+            return ""
+        return token
+
+    def _send(self, status, obj, extra_headers=None, head_only=False):
+        body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        for name, value in extra_headers or ():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            try:
+                self.wfile.write(body)
+                self._access_bytes = len(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._access_bytes = 0
+
+    def _send_empty(self, status, extra_headers=None):
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        for name, value in extra_headers or ():
+            self.send_header(name, value)
+        self.end_headers()
+
+    def send_error(self, code, message=None, explain=None):
+        del message, explain
+        if int(code) == 501 and not self._rate_allowed(self._path()):
+            return
+        names = {
+            400: "bad_request",
+            404: "not_found",
+            405: "method_not_allowed",
+            414: "request_uri_too_long",
+            431: "request_headers_too_large",
+            501: "not_implemented",
+            505: "http_version_not_supported",
+        }
+        self._send(int(code), {"error": names.get(int(code), "request_error")},
+                   head_only=(getattr(self, "command", "") == "HEAD"))
+
+    def _rate_allowed(self, path):
+        token = self._bearer()
+        remote = str(self.client_address[0]) if self.client_address else ""
+        principal = self.server.app.principal(token, remote)
+        allowed, retry_after = self.server.app.limiter.check(path, principal)
+        if allowed:
+            return True
+        self._send(429, {"error": "rate_limited"},
+                   (("Retry-After", str(max(1, int(math.ceil(retry_after))))),),
+                   head_only=(getattr(self, "command", "") == "HEAD"))
+        return False
+
+    def _not_found_or_method(self, path, head_only=False):
+        allow = ROUTE_ALLOW.get(path)
+        if allow is None:
+            self._send(404, {"error": "not_found"}, head_only=head_only)
+        else:
+            self._send(405, {"error": "method_not_allowed"},
+                       (("Allow", allow),), head_only=head_only)
+
+    def _dispatch_get(self, head_only=False):
+        path = self._path()
+        if not self._rate_allowed(path):
+            return
+        if path == "/health":
+            status, payload = self.server.app.health()
+            self._send(status, payload, head_only=head_only)
+            return
+        if path == "/token":
+            token = self._bearer()
+            if not self.server.app.token_authorized(token):
+                self._send(401, {"error": "unauthorized"},
+                           (("WWW-Authenticate", 'Bearer realm="qr-api"'),),
+                           head_only=head_only)
+                return
+            status, payload = self.server.app.token_payload()
+            self._send(status, payload, head_only=head_only)
+            return
+        self._not_found_or_method(path, head_only=head_only)
 
     def do_GET(self):
-        if self.path == "/health":
-            st = _read_json(STATE_PATH) or {"ok": False, "error": "no state.json"}
-            st["token_age_ms"] = _token_age_ms(_read_json(TOKEN_PATH))
-            self._send(200, st)
-        elif self.path == "/token":
-            if not _authorized_token(self):
-                self._send(401, {"error": "unauthorized"})
-                return
-            tok = _read_json(TOKEN_PATH)
-            if not tok or not tok.get("ok") or not tok.get("data"):
-                self._send(503, {"error": "no_data"})
-                return
-            age = _token_age_ms(tok)
-            if age is None or age > STALE_MS:
-                self._send(503, {"error": "stale", "age_ms": age})
-                return
-            self._send(200, {"ok": True, "data": tok["data"],
-                             "fetched_at_utc": tok.get("fetched_at_utc"), "age_ms": age})
-        else:
-            self._send(404, {"error": "not found"})
+        self._dispatch_get()
+
+    def do_HEAD(self):
+        self._dispatch_get(head_only=True)
 
     def do_POST(self):
-        if self.path == "/restart":
-            if not _authorized_admin(self):
-                self._send(401, {"error": "unauthorized"})
+        path = self._path()
+        if not self._rate_allowed(path):
+            return
+        if path == "/restart":
+            if not self.server.app.is_master(self._bearer()):
+                self._send(401, {"error": "unauthorized"},
+                           (("WWW-Authenticate", 'Bearer realm="qr-api"'),))
                 return
-            nonce = str(int(time.time() * 1000))
-            tmp = CONTROL_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"cmd": "restart", "nonce": nonce}, f)
-            os.replace(tmp, CONTROL_PATH)
+            try:
+                nonce = self.server.app.write_restart()
+            except OSError:
+                self._send(503, {"error": "unavailable"})
+                return
             self._send(200, {"ok": True, "restart_nonce": nonce})
-        else:
-            self._send(404, {"error": "not found"})
+            return
+        self._not_found_or_method(path)
+
+    def do_OPTIONS(self):
+        path = self._path()
+        if not self._rate_allowed(path):
+            return
+        allow = ROUTE_ALLOW.get(path)
+        if allow is None:
+            self._send(404, {"error": "not_found"})
+            return
+        self._send_empty(204, (("Allow", allow),))
+
+    def _known_method_not_allowed(self):
+        path = self._path()
+        if not self._rate_allowed(path):
+            return
+        self._not_found_or_method(path,
+                                  head_only=(getattr(self, "command", "") == "HEAD"))
+
+    do_PUT = _known_method_not_allowed
+    do_PATCH = _known_method_not_allowed
+    do_DELETE = _known_method_not_allowed
+    do_TRACE = _known_method_not_allowed
+    do_CONNECT = _known_method_not_allowed
+
+
+_SENTINEL = object()
+
+
+class BoundedExecutor:
+    """Fixed workers plus a queue with a strict pending-task bound."""
+
+    def __init__(self, workers: int, max_pending: int, name="bounded",
+                 error_handler=None):
+        if workers < 1 or max_pending < 1:
+            raise ValueError("workers and max_pending must be positive")
+        self._queue = queue.Queue(maxsize=max_pending)
+        self._closed = False
+        self._lock = threading.Lock()
+        self._error_handler = error_handler
+        self._threads = [
+            threading.Thread(target=self._worker,
+                             name="{}-{}".format(name, index + 1), daemon=True)
+            for index in range(workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    @property
+    def worker_count(self):
+        return len(self._threads)
+
+    @property
+    def pending_count(self):
+        return self._queue.qsize()
+
+    def submit(self, fn, *args):
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._queue.put_nowait((fn, args))
+            except queue.Full:
+                return False
+            return True
+
+    def shutdown(self, wait=True):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        for _ in self._threads:
+            self._queue.put(_SENTINEL)
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+    def _worker(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is _SENTINEL:
+                    return
+                fn, args = item
+                try:
+                    fn(*args)
+                except Exception as exc:
+                    if self._error_handler is not None:
+                        self._error_handler(exc)
+            finally:
+                self._queue.task_done()
+
+
+class BoundedHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class, app: ApiApplication,
+                 workers: int, pending: int, socket_timeout: float):
+        self.app = app
+        self.socket_timeout = socket_timeout
+        self.request_queue_size = workers + pending
+        self._executor = BoundedExecutor(
+            workers, pending, name="qr-api", error_handler=self._executor_error)
+        try:
+            super().__init__(server_address, handler_class)
+        except Exception:
+            self._executor.shutdown()
+            raise
+
+    @property
+    def executor(self):
+        return self._executor
+
+    def _executor_error(self, exc):
+        del exc
+        self.app.log_server_event("worker_error", "")
+
+    def process_request(self, request, client_address):
+        request.settimeout(self.socket_timeout)
+        if not self._executor.submit(self._process_request, request, client_address):
+            self._reject_busy(request, client_address)
+            self.shutdown_request(request)
+
+    def _process_request(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.app.log_server_event("request_error", client_address[0])
+        finally:
+            self.shutdown_request(request)
+
+    def _reject_busy(self, request, client_address):
+        body = b'{"error":"busy"}'
+        lines = [
+            "HTTP/1.0 503 Service Unavailable",
+            "Server: qr-api",
+            "Date: {}".format(formatdate(timeval=self.app.wall_clock(), usegmt=True)),
+            "Content-Type: application/json; charset=utf-8",
+            "Content-Length: {}".format(len(body)),
+            "Connection: close",
+        ]
+        lines.extend("{}: {}".format(name, value) for name, value in SECURITY_HEADERS)
+        response = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
+        try:
+            request.sendall(response)
+        except OSError:
+            pass
+        self.app.log_server_event("server_busy", client_address[0])
+
+    def server_close(self):
+        try:
+            super().server_close()
+        finally:
+            self._executor.shutdown()
+
+
+def make_server(config: ApiConfig, server_address=None,
+                wall_clock: Callable[[], float] = time.time,
+                monotonic: Callable[[], float] = time.monotonic,
+                log_sink=None):
+    address = server_address or (config.bind, config.port)
+    app = ApiApplication(config, wall_clock, monotonic, log_sink)
+    return BoundedHTTPServer(
+        address, Handler, app, config.workers, config.pending,
+        config.socket_timeout_seconds)
 
 
 def main():
-    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+    config = load_config()
+    os.umask(0o077)
+    server = make_server(config)
+    stop_event = threading.Event()
+
+    def stop(signum, frame):
+        del signum, frame
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    server.timeout = 0.5
+    try:
+        while not stop_event.is_set():
+            server.handle_request()
+    except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
