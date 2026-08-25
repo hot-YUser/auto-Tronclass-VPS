@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""TronClass 公有雲 QR 點名 data 採集 keeper（純 stdlib，Python 3.9+）。
+"""TronClass QR token harvester (Python 3.9+, standard library only).
 
-保持一場 in_progress QR 點名，每 POLL_SECONDS 輪詢 qr_code 端點採集當下 data。設計重點：
-- Cookie 落地：教師/學生 session cookie 原子寫入磁碟（LWPCookieJar），啟動載入重用；
-  只有在沒有有效 cookie 時才 login，任何進程重啟都不重登。
-- 單一長效點名：開場 duration 取伺服器上限（end_time 卡 9999 年 datetime 天花板）；預設每次
-  建場動態算「到 9999-01-01」＝當下最大，只有點名真的結束才重建（fallback）。
-- 對外 API 已拆出（qr_api.py 獨立進程），本檔每 poll 原子寫 token.json（供 API 讀），
-  並輪詢 control.json 收「重建點名」指令。
-- 全量語料 tokens-YYYYMMDD.jsonl.gz（每日輪轉、容量上限、低磁碟時停寫語料不影響採集）。
-- 每 SELFTEST_SECONDS 以學生帳號用最新 token 實答做端到端活性檢查；每 LOGINPROBE_SECONDS
-  以拋棄式 jar 全新登入做對照（不碰主 cookie）。
-零第三方依賴。環境變數見 secrets.env。
+The keeper maintains a teacher session and an in-progress QR rollcall, writes a
+strictly validated token record atomically, and publishes a small local state
+record for the separate read-only API. Its self-check is passive: it only reads
+and validates the local token record.
 """
 from __future__ import annotations
 
@@ -23,44 +16,112 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from typing import Mapping, Optional
 
-BASE = os.environ.get("QR_BASE", "https://www.tronclass.com.tw").rstrip("/")
-COURSE_ID = os.environ.get("QR_COURSE_ID", "55379")
-TEACHER_USER = os.environ.get("QR_TEACHER_USER", "")
-TEACHER_PASS = os.environ.get("QR_TEACHER_PASS", "")
-STUDENT_USER = os.environ.get("QR_STUDENT_USER", "")
-STUDENT_PASS = os.environ.get("QR_STUDENT_PASS", "")
-POLL_SECONDS = float(os.environ.get("QR_POLL_SECONDS", "0.5"))
-WORKDIR = os.environ.get("QR_WORKDIR", "/home/opc/qr-harvest")
-SELFTEST_SECONDS = float(os.environ.get("QR_SELFTEST_SECONDS", "3600"))
-LOGINPROBE_SECONDS = float(os.environ.get("QR_LOGINPROBE_SECONDS", "21600"))
-STATE_WRITE_SECONDS = float(os.environ.get("QR_STATE_WRITE_SECONDS", "5"))
-COOKIE_RESAVE_SECONDS = float(os.environ.get("QR_COOKIE_RESAVE_SECONDS", "300"))
-# 一直沿用同一場點名：開場 duration 拉到伺服器上限。實測上限＝rollcall end_time 卡在 DB 的
-# 9999 年 datetime 天花板（約 7978 年；超過即 500 溢位）。預設每次建場動態算「到 9999-01-01」
-# ＝當下最大值（留 ~11 個月餘裕避免溢位）。QR_ROLLCALL_DURATION_SECONDS 設正整數可覆寫。
-_ROLLCALL_DURATION_ENV = os.environ.get("QR_ROLLCALL_DURATION_SECONDS", "").strip()
+from qr_common import ConfigError, TOKEN_RE, env_choice, env_float, env_int, env_text
+from qr_common import env_utc_date, validate_token_record
+
+
+@dataclass(frozen=True)
+class KeeperConfig:
+    base: str
+    course_id: str
+    teacher_user: str
+    teacher_pass: str
+    poll_seconds: float
+    workdir: str
+    passive_check_seconds: float
+    state_write_seconds: float
+    cookie_resave_seconds: float
+    rollcall_duration: str
+    preserve_mode: str
+    preserve_after: str
+    stale_ms: int
+    future_skew_ms: int
+    socket_timeout_seconds: float
+
+
+def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
+    values = os.environ if env is None else env
+    base = env_text(values, "QR_BASE", "https://www.tronclass.com.tw", required=True).rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname \
+            or parsed.username is not None or parsed.password is not None:
+        raise ConfigError("QR_BASE must be an http(s) origin without credentials")
+    course_id = env_text(values, "QR_COURSE_ID", required=True)
+    if not course_id.isdigit() or int(course_id) <= 0:
+        raise ConfigError("QR_COURSE_ID must be a positive integer")
+    preserve_mode = env_choice(
+        values, "QR_PRESERVE_MODE", "auto", ("on", "off", "auto"))
+    preserve_after = env_utc_date(
+        values, "QR_PRESERVE_AFTER", required=(preserve_mode == "auto"))
+    duration = env_text(values, "QR_ROLLCALL_DURATION_SECONDS", default="")
+    if duration and (not duration.isdigit() or int(duration) <= 0):
+        raise ConfigError("QR_ROLLCALL_DURATION_SECONDS must be a positive integer")
+    return KeeperConfig(
+        base=base,
+        course_id=course_id,
+        teacher_user=env_text(values, "QR_TEACHER_USER", required=True),
+        teacher_pass=env_text(values, "QR_TEACHER_PASS", required=True),
+        poll_seconds=env_float(values, "QR_POLL_SECONDS", 0.5,
+                               minimum=0.0, minimum_exclusive=True),
+        workdir=env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True),
+        passive_check_seconds=env_float(
+            values, "QR_PASSIVE_CHECK_SECONDS", 5.0,
+            minimum=0.0, minimum_exclusive=True),
+        state_write_seconds=env_float(
+            values, "QR_STATE_WRITE_SECONDS", 5.0,
+            minimum=0.0, minimum_exclusive=True),
+        cookie_resave_seconds=env_float(
+            values, "QR_COOKIE_RESAVE_SECONDS", 300.0,
+            minimum=0.0, minimum_exclusive=True),
+        rollcall_duration=duration,
+        preserve_mode=preserve_mode,
+        preserve_after=preserve_after,
+        stale_ms=env_int(values, "QR_STALE_MS", 3000, minimum=1),
+        future_skew_ms=env_int(values, "QR_FUTURE_SKEW_MS", 1000, minimum=0),
+        socket_timeout_seconds=env_float(
+            values, "QR_SOCKET_TIMEOUT_SECONDS", 20.0,
+            minimum=0.0, minimum_exclusive=True, maximum=300.0),
+    )
+
+
+BASE = "https://www.tronclass.com.tw"
+COURSE_ID = ""
+TEACHER_USER = ""
+TEACHER_PASS = ""
+POLL_SECONDS = 0.5
+WORKDIR = "/home/opc/qr-harvest"
+PASSIVE_CHECK_SECONDS = 5.0
+STATE_WRITE_SECONDS = 5.0
+COOKIE_RESAVE_SECONDS = 300.0
+_ROLLCALL_DURATION_ENV = ""
+PRESERVE_MODE = "off"
+PRESERVE_AFTER = ""
+STALE_MS = 3000
+FUTURE_SKEW_MS = 1000
+SOCKET_TIMEOUT_SECONDS = 20.0
 
 COOKIE_PATH = os.path.join(WORKDIR, "cookies.txt")
-STUDENT_COOKIE_PATH = os.path.join(WORKDIR, "cookies-student.txt")
 TOKEN_PATH = os.path.join(WORKDIR, "token.json")
 STATE_PATH = os.path.join(WORKDIR, "state.json")
 CONTROL_PATH = os.path.join(WORKDIR, "control.json")
 RID_PATH = os.path.join(WORKDIR, "rollcall.json")
 
-TOKEN_RE = re.compile(r"\d{10}[0-9a-f]{32}")
 FORM_JSON_RE = re.compile(r":email-login-form\s*=\s*(['\"])(.*?)\1", re.S)
 HIDDEN_RE = re.compile(r"email-login-hidden-tag\s*=\s*(['\"])(.*?)\1", re.S)
 
-socket.setdefaulttimeout(20)
 os.umask(0o077)
-
+STOP_EVENT = threading.Event()
+LOCK = threading.Lock()
 STATE = {
     "ok": False,
     "preserve": False,
@@ -75,12 +136,38 @@ STATE = {
     "recreated": 0,
     "last_error": "",
     "preserve_alert": "",
-    "self_test_last": {},
-    "login_probe_last": {},
+    "passive_check_last": {},
     "corpus_bytes": 0,
     "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 }
-LOCK = threading.Lock()
+
+
+def apply_config(config: KeeperConfig) -> None:
+    global BASE, COURSE_ID, TEACHER_USER, TEACHER_PASS, POLL_SECONDS, WORKDIR
+    global PASSIVE_CHECK_SECONDS, STATE_WRITE_SECONDS, COOKIE_RESAVE_SECONDS
+    global _ROLLCALL_DURATION_ENV, PRESERVE_MODE, PRESERVE_AFTER
+    global STALE_MS, FUTURE_SKEW_MS, SOCKET_TIMEOUT_SECONDS
+    global COOKIE_PATH, TOKEN_PATH, STATE_PATH, CONTROL_PATH, RID_PATH
+    BASE = config.base
+    COURSE_ID = config.course_id
+    TEACHER_USER = config.teacher_user
+    TEACHER_PASS = config.teacher_pass
+    POLL_SECONDS = config.poll_seconds
+    WORKDIR = config.workdir
+    PASSIVE_CHECK_SECONDS = config.passive_check_seconds
+    STATE_WRITE_SECONDS = config.state_write_seconds
+    COOKIE_RESAVE_SECONDS = config.cookie_resave_seconds
+    _ROLLCALL_DURATION_ENV = config.rollcall_duration
+    PRESERVE_MODE = config.preserve_mode
+    PRESERVE_AFTER = config.preserve_after
+    STALE_MS = config.stale_ms
+    FUTURE_SKEW_MS = config.future_skew_ms
+    SOCKET_TIMEOUT_SECONDS = config.socket_timeout_seconds
+    COOKIE_PATH = os.path.join(WORKDIR, "cookies.txt")
+    TOKEN_PATH = os.path.join(WORKDIR, "token.json")
+    STATE_PATH = os.path.join(WORKDIR, "state.json")
+    CONTROL_PATH = os.path.join(WORKDIR, "control.json")
+    RID_PATH = os.path.join(WORKDIR, "rollcall.json")
 
 
 def _now_utc():
@@ -103,12 +190,10 @@ def _set(**kw):
 
 def _http_error_summary(exc):
     if isinstance(exc, urllib.error.HTTPError):
-        try:
-            body = exc.read(200).decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        return "HTTP {} {}".format(exc.code, body[:120])
-    return "{}: {}".format(type(exc).__name__, exc)
+        return "HTTP {}".format(exc.code)
+    if isinstance(exc, RuntimeError):
+        return str(exc)[:160]
+    return type(exc).__name__
 
 
 def _write_json_atomic(path, obj):
@@ -122,33 +207,26 @@ def _read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return None
 
 
-def preserve_active():
-    """preserve 模式是否啟用。QR_PRESERVE_MODE=on|off|auto（預設 auto）；
-    auto 時當 UTC 日期 >= QR_PRESERVE_AFTER（YYYY-MM-DD）即自動啟用。"""
-    mode = os.environ.get("QR_PRESERVE_MODE", "auto").strip().lower()
-    if mode == "on":
+def preserve_active(current_date=None):
+    """Return whether the configured cookie-preservation mode is active."""
+    if PRESERVE_MODE == "on":
         return True
-    if mode == "off":
+    if PRESERVE_MODE == "off":
         return False
-    after = os.environ.get("QR_PRESERVE_AFTER", "").strip()
-    if not after:
-        return False
-    return time.strftime("%Y-%m-%d", time.gmtime()) >= after
+    today = current_date or time.strftime("%Y-%m-%d", time.gmtime())
+    return bool(PRESERVE_AFTER) and today >= PRESERVE_AFTER
 
 
-# --------------------------------------------------------------------------- #
-# Cookie 持久化（LWPCookieJar；session cookie 是 discard cookie，兩旗標缺一不可）
-# --------------------------------------------------------------------------- #
 def _load_jar(path):
     jar = http.cookiejar.LWPCookieJar(path)
     if os.path.exists(path):
         try:
             jar.load(ignore_discard=True, ignore_expires=True)
-        except Exception:
+        except (OSError, http.cookiejar.LoadError):
             pass
     return jar
 
@@ -179,21 +257,20 @@ def _json_req(op, url, payload=None, method=None):
         raw = exc.read().decode("utf-8", "replace")
     try:
         return status, json.loads(raw)
-    except ValueError:
-        return status, raw
+    except (TypeError, ValueError):
+        return status, None
 
 
 def session_valid(op):
     try:
         check = op.open(BASE + "/api/my-courses").read().decode("utf-8", "replace")
         return '"courses"' in check
-    except Exception:
+    except (OSError, urllib.error.URLError, ValueError):
         return False
 
 
 def login(user, passwd, jar):
-    """公有雲 email 登入：GET /login -> 解析 email-login-form JSON 與 hidden 欄位 ->
-    POST /login?login=email 表單編碼 -> GET /api/my-courses 驗證。cookie 落在傳入的 jar。"""
+    """Open a teacher email session and keep cookies in the supplied jar."""
     op = _opener(jar)
     page = op.open(BASE + "/login").read().decode("utf-8", "replace")
     mj = FORM_JSON_RE.search(page)
@@ -204,7 +281,7 @@ def login(user, passwd, jar):
             value = json.loads(html.unescape(mj.group(2)))
             if isinstance(value, dict):
                 fields.update(value)
-        except Exception:
+        except (TypeError, ValueError):
             pass
     if mh:
         for tag in re.findall(r"<input\b[^>]*>", html.unescape(mh.group(2)), re.I):
@@ -222,15 +299,12 @@ def login(user, passwd, jar):
     req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
     op.open(req).read()
     if not session_valid(op):
-        raise RuntimeError("login validation failed (no courses in /api/my-courses)")
+        raise RuntimeError("login validation failed")
     return op
 
 
-# --------------------------------------------------------------------------- #
-# Rollcall 生命週期
-# --------------------------------------------------------------------------- #
 def build_qr_payload(title):
-    """建立一場 QR 點名（in_progress、type=qr_rollcall）的 payload。"""
+    """Build the teacher-side QR rollcall creation payload."""
     return {
         "title": title,
         "status": "in_progress",
@@ -248,7 +322,6 @@ def build_qr_payload(title):
 
 
 def extract_rollcall_id(body):
-    """從回應抽出 rollcall id：先看 id/rollcall_id/rollcallId，再遞迴巢狀 rollcall/data。"""
     if isinstance(body, dict):
         for key in ("id", "rollcall_id", "rollcallId"):
             value = body.get(key)
@@ -262,58 +335,49 @@ def extract_rollcall_id(body):
 
 
 def _max_rollcall_duration():
-    """到 9999-01-01 的秒數＝伺服器可接受的最大 duration 上限（end_time 卡 9999 年天花板；留餘裕避免溢位）。"""
     try:
-        return max(0, int(calendar.timegm((9999, 1, 1, 0, 0, 0, 0, 0, 0)) - time.time()))
-    except Exception:
-        return 157680000000  # ~5000y fallback
+        return max(0, int(calendar.timegm(
+            (9999, 1, 1, 0, 0, 0, 0, 0, 0)) - time.time()))
+    except (OverflowError, OSError, ValueError):
+        return 157680000000
 
 
 def _duration_ladder():
-    if _ROLLCALL_DURATION_ENV.isdigit() and int(_ROLLCALL_DURATION_ENV) > 0:
-        top = int(_ROLLCALL_DURATION_ENV)
-    else:
-        top = _max_rollcall_duration()
-    return (top, 3153600000, 31536000, 2592000, 86400, 7200, 0)  # 上限→100y→1y→30d→1d→2h→預設
+    top = int(_ROLLCALL_DURATION_ENV) if _ROLLCALL_DURATION_ENV else _max_rollcall_duration()
+    return (top, 3153600000, 31536000, 2592000, 86400, 7200, 0)
 
 
 def create_rollcall(op):
-    """建立並 start 一場 QR 點名，duration 拉到伺服器上限（~9999 年）。若被拒（500 溢位或無
-    id），沿 ladder 退到較小值，確保一定建得起來。回傳 rid。點名的 end_time 由 harvester 的
-    _record_rollcall_meta 寫進 STATE（/health 可見）。"""
-    last = ""
+    last_status = 0
     seen = set()
-    for d in _duration_ladder():
-        d = max(0, int(d))
-        if d in seen:
+    for duration in _duration_ladder():
+        duration = max(0, int(duration))
+        if duration in seen:
             continue
-        seen.add(d)
+        seen.add(duration)
         payload = build_qr_payload(time.strftime("%Y.%m.%d %H:%M", time.gmtime()))
-        payload["duration"] = d
+        payload["duration"] = duration
         status, body = _json_req(
             op, BASE + "/api/course/{}/rollcall".format(COURSE_ID), payload)
         rid = extract_rollcall_id(body)
         if not rid:
-            last = "HTTP {} {}".format(status, str(body)[:120])
+            last_status = status
             continue
         _json_req(op, BASE + "/api/rollcall/{}/start-rollcall".format(rid),
-                  {"duration": d} if d > 0 else None, "POST")
-        _set(rollcall_duration=d)
+                  {"duration": duration} if duration > 0 else None, "POST")
+        _set(rollcall_duration=duration)
         return rid
-    raise RuntimeError("create rollcall failed (all durations): {}".format(last))
+    raise RuntimeError("create rollcall failed (HTTP {})".format(last_status))
 
 
 def _record_rollcall_meta(op, rid):
-    """從 rollcalls 列表撈當前點名的 end_time/status 寫進 STATE（/health 自報這場撐到何時）。
-    end_time 只在列表回應出現、不在建場回應。回傳 True＝已找到並記錄；False＝列表尚未含此
-    rid（最終一致性延遲），呼叫端應下輪重試，勿提前鎖定。"""
     try:
         for row in list_rollcalls(op):
             if str(row.get("id")) == str(rid):
                 _set(rollcall_finished_at=str(row.get("end_time") or ""),
                      rollcall_status=str(row.get("status") or ""))
                 return True
-    except Exception:
+    except (OSError, TypeError, ValueError, urllib.error.URLError):
         pass
     return False
 
@@ -322,7 +386,8 @@ def list_rollcalls(op):
     status, body = _json_req(op, BASE + "/api/course/{}/rollcalls".format(COURSE_ID))
     if status != 200 or not isinstance(body, dict):
         return []
-    return body.get("rollcalls") or []
+    rows = body.get("rollcalls")
+    return rows if isinstance(rows, list) else []
 
 
 def live_qr_rollcall(op):
@@ -334,14 +399,15 @@ def live_qr_rollcall(op):
 
 
 def stop_rollcall(op, rid):
-    _json_req(op, BASE + "/api/rollcall/{}/stop_qr_rollcall".format(rid), payload=None, method="PUT")
+    _json_req(op, BASE + "/api/rollcall/{}/stop_qr_rollcall".format(rid),
+              payload=None, method="PUT")
 
 
 def _save_rid(rid):
     _set(rollcall_id=rid)
     try:
         _write_json_atomic(RID_PATH, {"rollcall_id": rid, "saved_utc": _now_utc()})
-    except Exception:
+    except OSError:
         pass
 
 
@@ -350,11 +416,20 @@ def _load_rid():
     return str((rec or {}).get("rollcall_id") or "") if isinstance(rec, dict) else ""
 
 
-def _write_token(data, ts, rid):
-    _write_json_atomic(TOKEN_PATH, {
-        "ok": True, "data": data, "ts": ts,
-        "fetched_at_utc": _now_utc(), "rollcall_id": rid,
-    })
+def _write_token(data, ts, rid, now_ms=None):
+    record = {
+        "ok": True,
+        "data": data,
+        "ts": ts,
+        "fetched_at_utc": _now_utc(),
+        "rollcall_id": rid,
+    }
+    checked = validate_token_record(
+        record, _utc_ms() if now_ms is None else now_ms, STALE_MS, FUTURE_SKEW_MS)
+    if not checked.valid:
+        raise RuntimeError("token rejected: {}".format(checked.error))
+    _write_json_atomic(TOKEN_PATH, record)
+    return checked.age_ms
 
 
 def _control_nonce():
@@ -362,11 +437,8 @@ def _control_nonce():
     return str((rec or {}).get("nonce") or "") if isinstance(rec, dict) else ""
 
 
-# --------------------------------------------------------------------------- #
-# 語料（每日輪轉 gzip JSONL）
-# --------------------------------------------------------------------------- #
 class Corpus:
-    """每日輪轉的 gzip JSONL 語料檔；每 20 行 flush；總量 >15GB 刪最舊檔。"""
+    """Daily rotating gzip JSONL corpus with bounded storage."""
 
     def __init__(self):
         self.f = None
@@ -374,21 +446,28 @@ class Corpus:
         self.bytes = 0
         self.pending = 0
 
+    def close(self):
+        if self.f is not None:
+            try:
+                self.f.flush()
+            finally:
+                self.f.close()
+                self.f = None
+
     def _prune(self):
         files = sorted(f for f in os.listdir(WORKDIR)
                        if re.fullmatch(r"tokens-\d{8}\.jsonl\.gz", f))
         total = sum(os.path.getsize(os.path.join(WORKDIR, f)) for f in files)
-        for f in list(files):
+        for filename in list(files):
             if total <= 15 * 1024 ** 3 or len(files) == 1:
                 break
-            path = os.path.join(WORKDIR, f)
+            path = os.path.join(WORKDIR, filename)
             total -= os.path.getsize(path)
             os.remove(path)
-            files.remove(f)
+            files.remove(filename)
 
     def _open_day(self):
-        if self.f:
-            self.f.close()
+        self.close()
         self._prune()
         self.day = time.strftime("%Y%m%d", time.gmtime())
         path = os.path.join(WORKDIR, "tokens-{}.jsonl.gz".format(self.day))
@@ -410,9 +489,6 @@ class Corpus:
         _set(corpus_bytes=self.bytes)
 
 
-# --------------------------------------------------------------------------- #
-# Harvester 主迴圈（normal / preserve 兩種規制）
-# --------------------------------------------------------------------------- #
 def harvester():
     op = None
     jar = None
@@ -422,157 +498,147 @@ def harvester():
     last_cookie_save = 0.0
     last_ctrl = _control_nonce()
     last_meta_rid = ""
-    while True:
-        preserve = preserve_active()
-        _set(preserve=preserve)
-        try:
-            # 控制檔：重建點名（preserve 模式不主動重建，忽略）
-            ctrl = _control_nonce()
-            if ctrl != last_ctrl:
-                last_ctrl = ctrl
-                if not preserve and op is not None and rid:
-                    try:
-                        stop_rollcall(op, rid)
-                    except Exception:
-                        pass
-                    rid = ""
+    try:
+        while not STOP_EVENT.is_set():
+            preserve = preserve_active()
+            _set(preserve=preserve)
+            try:
+                ctrl = _control_nonce()
+                if ctrl != last_ctrl:
+                    last_ctrl = ctrl
+                    if not preserve and op is not None and rid:
+                        try:
+                            stop_rollcall(op, rid)
+                        except (OSError, urllib.error.URLError):
+                            pass
+                        rid = ""
 
-            # 確保 opener：一律從磁碟重載凍結 cookie
-            if op is None:
-                jar = _load_jar(COOKIE_PATH)
-                op = _opener(jar)
-                if not preserve and not session_valid(op):
-                    op = login(TEACHER_USER, TEACHER_PASS, jar)
-                    _save_jar_atomic(jar, COOKIE_PATH)
-                    with LOCK:
-                        STATE["logins"] = STATE.get("logins", 0) + 1
-                        STATE["session_since_utc"] = _now_utc()
-                        STATE["last_error"] = ""
-                    last_cookie_save = time.time()
+                if op is None:
+                    jar = _load_jar(COOKIE_PATH)
+                    op = _opener(jar)
+                    if not preserve and not session_valid(op):
+                        op = login(TEACHER_USER, TEACHER_PASS, jar)
+                        _save_jar_atomic(jar, COOKIE_PATH)
+                        with LOCK:
+                            STATE["logins"] = STATE.get("logins", 0) + 1
+                            STATE["session_since_utc"] = _now_utc()
+                            STATE["last_error"] = ""
+                        last_cookie_save = time.time()
 
-            # 確保 rollcall（點名約 2h 自動 is_finished，兩模式都需以 cookie 重建；
-            # preserve 差別只在「絕不 login」，create/poll 仍用凍結 cookie 續命）
-            if not rid:
-                rid = live_qr_rollcall(op)
                 if not rid:
-                    rid = create_rollcall(op)
-                    with LOCK:
-                        STATE["recreated"] = STATE.get("recreated", 0) + 1
-                if rid:
-                    _save_rid(rid)
+                    rid = live_qr_rollcall(op)
+                    if not rid:
+                        rid = create_rollcall(op)
+                        with LOCK:
+                            STATE["recreated"] = STATE.get("recreated", 0) + 1
+                    if rid:
+                        _save_rid(rid)
 
-            # rid 變動時（含開機從磁碟載入）查列表記錄 end_time/status；查不到（列表延遲）下輪重試
-            if rid and rid != last_meta_rid:
-                if _record_rollcall_meta(op, rid):
+                if rid and rid != last_meta_rid and _record_rollcall_meta(op, rid):
                     last_meta_rid = rid
 
-            # 輪詢 qr_code
-            status, body = _json_req(
-                op, BASE + "/api/course/{}/rollcall/{}/qr_code".format(COURSE_ID, rid))
-            data = str((body or {}).get("data") or "") if isinstance(body, dict) else ""
-            if status != 200 or not TOKEN_RE.fullmatch(data):
-                raise RuntimeError("qr_code bad: HTTP {} body {}".format(status, str(body)[:120]))
-            ts = int(data[:10])
-            age_ms = _utc_ms() - ts * 1000
-            with LOCK:
-                STATE.update(last_fetch_utc=_now_utc(), age_ms=age_ms,
-                             rollcall_id=rid, ok=True, last_error="")
-            _write_token(data, ts, rid)
-            corpus.write(json.dumps({"utc": _now_utc(), "ts": ts, "data": data}))
-
-            # 週期回存 cookie（normal 模式；preserve 凍結磁碟 cookie 不覆寫）
-            if not preserve and jar is not None and \
-                    time.time() - last_cookie_save > COOKIE_RESAVE_SECONDS:
-                try:
-                    _save_jar_atomic(jar, COOKIE_PATH)
-                    last_cookie_save = time.time()
-                except Exception:
-                    pass
-
-            backoff = 1.0
-            time.sleep(POLL_SECONDS)
-        except Exception as exc:
-            msg = _http_error_summary(exc)
-            _set(ok=False, last_error=msg)
-            if preserve:
-                _set(preserve_alert=_now_utc())
-            print("harvest error: {} (backoff {}s, preserve={})".format(msg, backoff, preserve),
-                  flush=True)
-            auth_loss = (isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403)) \
-                or "login validation failed" in msg
-            if auth_loss:
-                # normal：丟 session、下輪重登。preserve：op=None 只重載凍結 cookie，
-                # 絕不 login、絕不刪 cookie（下輪以凍結 cookie 重建/重試）。
-                op = None
-                rid = ""
-            else:
-                # 非 auth（多為點名已 is_finished）→ 清 rid，下輪以 cookie 重建（兩模式同）。
-                try:
-                    if op is not None and rid and not live_qr_rollcall(op):
-                        rid = ""
-                except Exception:
-                    op = None
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-
-
-def self_test():
-    """每 SELFTEST_SECONDS 以學生帳號將最新 token 實答點名——整條鏈的活性證明。
-    學生 session 亦落地（cookies-student.txt）；preserve 模式下不驗證/不重登，直接以既有
-    cookie 試答。"""
-    while True:
-        try:
-            tok = _read_json(TOKEN_PATH) or {}
-            data = tok.get("data") or ""
-            rid = tok.get("rollcall_id") or ""
-            if data and rid:
-                jar = _load_jar(STUDENT_COOKIE_PATH)
-                op = _opener(jar)
-                if not preserve_active() and not session_valid(op):
-                    op = login(STUDENT_USER, STUDENT_PASS, jar)
-                    _save_jar_atomic(jar, STUDENT_COOKIE_PATH)
                 status, body = _json_req(
-                    op, BASE + "/api/rollcall/{}/answer_qr_rollcall".format(rid),
-                    {"data": data, "deviceId": "qr-harvest-selftest"}, method="PUT")
-                _set(self_test_last={"utc": _now_utc(), "http": status,
-                                     "body": str(body)[:160], "preserve": preserve_active()})
-        except Exception as exc:
-            _set(self_test_last={"utc": _now_utc(), "error": _http_error_summary(exc)})
-        time.sleep(SELFTEST_SECONDS)
+                    op, BASE + "/api/course/{}/rollcall/{}/qr_code".format(COURSE_ID, rid))
+                data = str((body or {}).get("data") or "") if isinstance(body, dict) else ""
+                if status != 200 or TOKEN_RE.fullmatch(data) is None:
+                    raise RuntimeError("qr_code invalid response (HTTP {})".format(status))
+                ts = int(data[:10])
+                age_ms = _write_token(data, ts, rid)
+                with LOCK:
+                    STATE.update(last_fetch_utc=_now_utc(), age_ms=age_ms,
+                                 rollcall_id=rid, ok=True, last_error="")
+                corpus.write(json.dumps(
+                    {"utc": _now_utc(), "ts": ts, "data": data}, separators=(",", ":")))
+
+                if not preserve and jar is not None and \
+                        time.time() - last_cookie_save > COOKIE_RESAVE_SECONDS:
+                    try:
+                        _save_jar_atomic(jar, COOKIE_PATH)
+                        last_cookie_save = time.time()
+                    except OSError:
+                        pass
+
+                backoff = 1.0
+                STOP_EVENT.wait(POLL_SECONDS)
+            except Exception as exc:
+                msg = _http_error_summary(exc)
+                _set(ok=False, last_error=msg)
+                if preserve:
+                    _set(preserve_alert=_now_utc())
+                print("harvest error: {} (backoff {}s, preserve={})".format(
+                    msg, backoff, preserve), flush=True)
+                auth_loss = (isinstance(exc, urllib.error.HTTPError)
+                             and exc.code in (401, 403)) \
+                    or "login validation failed" in msg
+                if auth_loss:
+                    op = None
+                    rid = ""
+                else:
+                    try:
+                        if op is not None and rid and not live_qr_rollcall(op):
+                            rid = ""
+                    except (OSError, urllib.error.URLError):
+                        op = None
+                STOP_EVENT.wait(backoff)
+                backoff = min(backoff * 2, 60.0)
+    finally:
+        corpus.close()
 
 
-def login_probe():
-    """每 LOGINPROBE_SECONDS 一次全新登入作為對照。
-    用拋棄式 in-memory jar，絕不碰主 cookie 檔。"""
-    while True:
-        try:
-            login(TEACHER_USER, TEACHER_PASS, http.cookiejar.LWPCookieJar())
-            _set(login_probe_last={"utc": _now_utc(), "ok": True})
-        except Exception as exc:
-            _set(login_probe_last={"utc": _now_utc(), "ok": False,
-                                   "error": _http_error_summary(exc)})
-        time.sleep(LOGINPROBE_SECONDS)
+def passive_check():
+    """Passively validate the local token file without any network mutation."""
+    while not STOP_EVENT.is_set():
+        record = _read_json(TOKEN_PATH)
+        checked = validate_token_record(
+            record, _utc_ms(), STALE_MS, FUTURE_SKEW_MS)
+        result = {"utc": _now_utc(), "ok": checked.valid,
+                  "age_ms": checked.age_ms}
+        if not checked.valid:
+            result["error"] = checked.error
+        _set(passive_check_last=result)
+        STOP_EVENT.wait(PASSIVE_CHECK_SECONDS)
 
 
 def state_writer():
-    """每 STATE_WRITE_SECONDS 原子寫 state.json（健康面；不含 token，/health 無驗證）。"""
-    while True:
+    while not STOP_EVENT.is_set():
         try:
-            st = _get()
-            st.pop("last_data", None)  # 安全：token 只走 token.json（Bearer），絕不進 /health
-            _write_json_atomic(STATE_PATH, st)
-        except Exception as exc:
-            print("state write error: {}".format(exc), flush=True)
-        time.sleep(STATE_WRITE_SECONDS)
+            state = _get()
+            state.pop("last_data", None)
+            _write_json_atomic(STATE_PATH, state)
+        except OSError as exc:
+            print("state write error: {}".format(type(exc).__name__), flush=True)
+        STOP_EVENT.wait(STATE_WRITE_SECONDS)
+
+
+def _request_stop(signum, frame):
+    del signum, frame
+    STOP_EVENT.set()
 
 
 def main():
-    os.makedirs(WORKDIR, exist_ok=True)
-    for fn, name in ((harvester, "harvester"), (self_test, "self-test"),
-                     (login_probe, "login-probe"), (state_writer, "state-writer")):
-        threading.Thread(target=fn, name=name, daemon=True).start()
-    while True:
-        time.sleep(3600)
+    config = load_config()
+    apply_config(config)
+    socket.setdefaulttimeout(SOCKET_TIMEOUT_SECONDS)
+    os.makedirs(WORKDIR, mode=0o700, exist_ok=True)
+    STOP_EVENT.clear()
+    _set(started_utc=_now_utc(), ok=False, last_error="")
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    threads = [
+        threading.Thread(target=harvester, name="harvester"),
+        threading.Thread(target=passive_check, name="passive-check"),
+        threading.Thread(target=state_writer, name="state-writer"),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        STOP_EVENT.wait()
+    except KeyboardInterrupt:
+        STOP_EVENT.set()
+    finally:
+        STOP_EVENT.set()
+        for thread in threads:
+            thread.join()
 
 
 if __name__ == "__main__":
