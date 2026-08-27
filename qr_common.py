@@ -7,11 +7,17 @@ import json
 import math
 import os
 import re
+import stat
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
 
 TOKEN_RE = re.compile(r"[0-9]{10}[0-9a-f]{32}\Z")
+KEY_ID_RE = re.compile(r"k_[0-9a-f]{8}\Z")
+KEY_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
+MAX_KEY_LABEL_LENGTH = 128
 _PLACEHOLDER_MARKERS = (
     "changeme",
     "change-me",
@@ -89,6 +95,15 @@ def env_float(env: Mapping[str, str], name: str, default: float,
     return value
 
 
+def env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = _raw(env, name, "true" if default else "false").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError("{} must be true or false".format(name))
+
+
 def env_choice(env: Mapping[str, str], name: str, default: str, choices) -> str:
     value = env_text(env, name, default=default, required=True).lower()
     if value not in choices:
@@ -110,13 +125,104 @@ def env_utc_date(env: Mapping[str, str], name: str,
     return value
 
 
-def write_json_atomic(path, obj, **dump_options) -> None:
-    """Write one JSON document via same-directory atomic replacement."""
-    path = os.fspath(path)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(obj, handle, **dump_options)
-    os.replace(tmp, path)
+def _fsync_directory(path: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _replace_with_retry(source: str, target: str) -> None:
+    for attempt in range(20):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.01)
+
+
+def write_json_atomic(path, obj, *, durable: bool = False, **dump_options) -> None:
+    """Atomically replace JSON using a unique same-directory 0600 temp file.
+
+    `durable=True` additionally fsyncs the file and parent directory for key/control metadata.
+    High-frequency token/state writers use atomic visibility without forcing storage every poll.
+    """
+    target = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(target) or "."
+    if os.path.lexists(target) and stat.S_ISLNK(os.lstat(target).st_mode):
+        raise OSError("refusing to replace a symlink")
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=".{}-".format(os.path.basename(target)),
+        suffix=".tmp",
+        dir=parent,
+        text=True,
+    )
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(obj, handle, **dump_options)
+            handle.flush()
+            if durable:
+                os.fsync(handle.fileno())
+        _replace_with_retry(tmp, target)
+        if durable:
+            _fsync_directory(parent)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def validate_api_key_store(data):
+    """Return a validated current-schema key list; any corrupt record invalidates the store."""
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, list):
+        raise ValueError("invalid API key store")
+    ids = set()
+    hashes = set()
+    for record in keys:
+        if not isinstance(record, dict):
+            raise ValueError("invalid API key store")
+        kid = record.get("id")
+        digest = record.get("hash")
+        label = record.get("label", "")
+        expiry = record.get("expires_epoch")
+        if not isinstance(kid, str) or KEY_ID_RE.fullmatch(kid) is None:
+            raise ValueError("invalid API key store")
+        if not isinstance(digest, str) or KEY_HASH_RE.fullmatch(digest) is None:
+            raise ValueError("invalid API key store")
+        if kid in ids or digest in hashes:
+            raise ValueError("duplicate API key record")
+        if isinstance(expiry, bool) or not isinstance(expiry, int) or expiry <= 0:
+            raise ValueError("invalid API key store")
+        if not isinstance(record.get("revoked"), bool):
+            raise ValueError("invalid API key store")
+        if not isinstance(label, str) or len(label) > MAX_KEY_LABEL_LENGTH \
+                or any(ord(char) < 32 or ord(char) == 127 for char in label):
+            raise ValueError("invalid API key store")
+        for field in ("created_utc", "expires_utc"):
+            if not isinstance(record.get(field), str) or not record[field]:
+                raise ValueError("invalid API key store")
+        ids.add(kid)
+        hashes.add(digest)
+    return keys
 
 
 @dataclass(frozen=True)

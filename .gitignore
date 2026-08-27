@@ -10,8 +10,10 @@ cookies-student.txt
 token.json
 state.json
 control.json
+control-ack.json
 rollcall.json
 apikeys.json
+apikeys.json.lock
 tokens-*.jsonl.gz
 *.tmp
 

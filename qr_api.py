@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
 import queue
 import re
+import secrets
 import signal
 import socket
 import threading
@@ -21,11 +23,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Callable, Mapping, Optional
 
 from qr_common import ConfigError, env_float, env_int, env_text
-from qr_common import validate_token_record, write_json_atomic
+from qr_common import validate_api_key_store, validate_token_record, write_json_atomic
 
 
+SOURCE_URL = "https://github.com/hot-YUser/auto-Tronclass-VPS"
+SOURCE_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 SECURITY_HEADERS = (
-    ("Cache-Control", "no-store"),
+    ("Cache-Control", "no-store, max-age=0"),
+    ("Pragma", "no-cache"),
+    ("Expires", "0"),
     ("X-Content-Type-Options", "nosniff"),
     ("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
     ("X-Frame-Options", "DENY"),
@@ -36,15 +42,20 @@ SECURITY_HEADERS = (
 )
 ROUTE_ALLOW = {
     "/health": "GET, HEAD, OPTIONS",
+    "/source": "GET, HEAD, OPTIONS",
     "/token": "GET, HEAD, OPTIONS",
     "/restart": "POST, OPTIONS",
 }
 _SAFE_METHOD = re.compile(r"[A-Z]{1,12}\Z")
+_CONTROL_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+_TERMINAL_CONTROL_STATUSES = {"completed", "rejected_preserve", "failed"}
+MAX_JSON_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
 class ApiConfig:
     api_key: str
+    source_revision: str
     bind: str
     port: int
     stale_ms: int
@@ -67,20 +78,36 @@ class ApiConfig:
 def load_config(env: Optional[Mapping[str, str]] = None) -> ApiConfig:
     values = os.environ if env is None else env
     bind = env_text(values, "QR_BIND", "127.0.0.1", required=True)
-    if any(char.isspace() for char in bind):
-        raise ConfigError("QR_BIND must not contain whitespace")
+    try:
+        bind_ip = ipaddress.ip_address(bind)
+    except ValueError:
+        if bind.lower() != "localhost":
+            raise ConfigError("QR_BIND must be a loopback address")
+    else:
+        if not bind_ip.is_loopback:
+            raise ConfigError("QR_BIND must be a loopback address")
+    api_key = env_text(values, "QR_API_KEY", default="")
+    if api_key and len(api_key) < 32:
+        raise ConfigError("QR_API_KEY must contain at least 32 characters")
+    source_revision = env_text(values, "QR_SOURCE_REVISION", required=True).lower()
+    if SOURCE_REVISION_RE.fullmatch(source_revision) is None:
+        raise ConfigError("QR_SOURCE_REVISION must be a 40-character commit SHA")
+    workdir = env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True)
+    if not (os.path.isabs(workdir) or workdir.startswith("/")):
+        raise ConfigError("QR_WORKDIR must be absolute")
     return ApiConfig(
-        api_key=env_text(values, "QR_API_KEY", default=""),
+        api_key=api_key,
+        source_revision=source_revision,
         bind=bind,
         port=env_int(values, "QR_PORT", 8741, minimum=1, maximum=65535),
         stale_ms=env_int(values, "QR_STALE_MS", 3000, minimum=1),
         future_skew_ms=env_int(values, "QR_FUTURE_SKEW_MS", 1000, minimum=0),
-        workdir=env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True),
+        workdir=workdir,
         workers=env_int(values, "QR_API_WORKERS", 4, minimum=1, maximum=64),
         pending=env_int(values, "QR_API_PENDING", 16, minimum=1, maximum=1024),
         socket_timeout_seconds=env_float(
             values, "QR_SOCKET_TIMEOUT_SECONDS", 10.0,
-            minimum=0.0, minimum_exclusive=True, maximum=300.0),
+            minimum=0.0, minimum_exclusive=True, maximum=25.0),
         limiter_max_entries=env_int(
             values, "QR_LIMITER_MAX_ENTRIES", 1024, minimum=1, maximum=65536),
         global_rate=env_float(
@@ -101,9 +128,14 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ApiConfig:
 
 def _read_json(path):
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, TypeError, ValueError):
+        if os.path.islink(path) or os.path.getsize(path) > MAX_JSON_BYTES:
+            return None
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_JSON_BYTES + 1)
+        if len(raw) > MAX_JSON_BYTES:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, TypeError, ValueError):
         return None
 
 
@@ -163,23 +195,28 @@ class RequestLimiter:
             config.principal_rate, config.principal_burst,
             config.limiter_max_entries, clock)
         self.health_table = TokenBucketTable(
-            config.health_rate, config.health_burst, 1, clock)
+            config.health_rate, config.health_burst,
+            config.limiter_max_entries, clock)
         self.restart_table = TokenBucketTable(
             config.restart_rate, config.restart_burst, 1, clock)
 
-    def check(self, path: str, principal: str):
-        checks = [(self.global_table, "global")]
+    def check(self, path: str, client_key: str):
+        # Charge the route/client bucket first. Rejected traffic from one client must not drain
+        # the global budget shared by healthy clients.
+        checks = []
         if path == "/health":
-            checks.append((self.health_table, "health"))
-        elif path in ("/token", "/restart"):
-            checks.append((self.principal_table, principal))
-        if path == "/restart":
-            checks.append((self.restart_table, "restart"))
+            checks.append((self.health_table, client_key))
+        else:
+            checks.append((self.principal_table, client_key))
+        checks.append((self.global_table, "global"))
         for table, key in checks:
             allowed, retry_after = table.consume(key)
             if not allowed:
                 return False, retry_after
         return True, 0.0
+
+    def check_restart(self):
+        return self.restart_table.consume("restart")
 
 
 class ApiApplication:
@@ -194,6 +231,7 @@ class ApiApplication:
         self.token_path = os.path.join(config.workdir, "token.json")
         self.state_path = os.path.join(config.workdir, "state.json")
         self.control_path = os.path.join(config.workdir, "control.json")
+        self.control_ack_path = os.path.join(config.workdir, "control-ack.json")
         self.keys_path = os.path.join(config.workdir, "apikeys.json")
         self.limiter = RequestLimiter(config, monotonic)
 
@@ -205,10 +243,24 @@ class ApiApplication:
     def now_ms(self):
         return int(self.wall_clock() * 1000)
 
-    def principal(self, token: str, remote: str):
-        if token:
-            return "auth:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return "ip:" + remote
+    @staticmethod
+    def client_ip(peer: str, cloudflare_header: str = "") -> str:
+        """Trust CF-Connecting-IP only from a loopback tunnel peer; return one canonical IP."""
+        try:
+            peer_ip = ipaddress.ip_address(str(peer or "").strip())
+        except ValueError:
+            return "unknown"
+        header = str(cloudflare_header or "")
+        if peer_ip.is_loopback and header and header.strip() == header:
+            try:
+                return ipaddress.ip_address(header).compressed
+            except ValueError:
+                pass
+        return peer_ip.compressed
+
+    @staticmethod
+    def client_key(remote: str) -> str:
+        return "ip:" + str(remote or "unknown")
 
     def is_master(self, token: str):
         return bool(self.config.api_key) and hmac.compare_digest(
@@ -219,7 +271,10 @@ class ApiApplication:
             return False
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         data = _read_json(self.keys_path)
-        keys = data.get("keys", []) if isinstance(data, dict) else []
+        try:
+            keys = validate_api_key_store(data)
+        except ValueError:
+            return False
         now = int(self.wall_clock())
         for record in keys if isinstance(keys, list) else ():
             if not isinstance(record, dict):
@@ -253,6 +308,13 @@ class ApiApplication:
         }
         return (200 if ok else 503), payload
 
+    def source_payload(self):
+        return {
+            "repository": SOURCE_URL,
+            "license": "AGPL-3.0",
+            "revision": self.config.source_revision,
+        }
+
     def token_payload(self):
         token = _read_json(self.token_path)
         checked = validate_token_record(
@@ -269,12 +331,47 @@ class ApiApplication:
             "age_ms": checked.age_ms,
         }
 
-    def write_restart(self):
-        nonce = str(self.now_ms())
+    def _restart_is_pending(self):
+        request = _read_json(self.control_path)
+        if not isinstance(request, dict) or request.get("version") != 1 \
+                or request.get("cmd") != "restart":
+            return False
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) \
+                or _CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
+            return False
+        ack = _read_json(self.control_ack_path)
+        return not (
+            isinstance(ack, dict)
+            and ack.get("request_id") == request_id
+            and ack.get("status") in _TERMINAL_CONTROL_STATUSES
+        )
+
+    def request_restart(self):
+        state = _read_json(self.state_path)
+        if isinstance(state, dict) and state.get("preserve") is True:
+            return 409, {"error": "preserve_active"}
+        if self._restart_is_pending():
+            return 409, {"error": "restart_pending"}
+        request_id = secrets.token_urlsafe(18)
+        request = {
+            "version": 1,
+            "cmd": "restart",
+            "request_id": request_id,
+            "created_epoch_ms": self.now_ms(),
+        }
         write_json_atomic(
-            self.control_path, {"cmd": "restart", "nonce": nonce},
-            separators=(",", ":"))
-        return nonce
+            self.control_path,
+            request,
+            durable=True,
+            separators=(",", ":"),
+        )
+        return 202, {
+            "ok": True,
+            "status": "accepted",
+            "request_id": request_id,
+            "restart_nonce": request_id,
+        }
 
     def log_access(self, handler, status, duration_ms, response_bytes):
         method = getattr(handler, "command", "") or ""
@@ -286,9 +383,7 @@ class ApiApplication:
         except ValueError:
             parsed_path = ""
         path = parsed_path if parsed_path in ROUTE_ALLOW else "other"
-        remote = ""
-        if getattr(handler, "client_address", None):
-            remote = str(handler.client_address[0])
+        remote = handler._client_ip()
         entry = {
             "event": "http_access",
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.wall_clock())),
@@ -363,6 +458,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         for name, value in SECURITY_HEADERS:
             self.send_header(name, value)
+        self.send_header("Link", "<{}>; rel=\"source\"".format(SOURCE_URL))
+        self.send_header("X-Source-Revision", self.server.app.config.source_revision)
         for name, value in extra_headers or ():
             self.send_header(name, value)
         self.end_headers()
@@ -398,16 +495,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send(int(code), {"error": names.get(int(code), "request_error")},
                    head_only=(getattr(self, "command", "") == "HEAD"))
 
+    def _client_ip(self):
+        peer = str(self.client_address[0]) if self.client_address else ""
+        header = self.headers.get("CF-Connecting-IP", "") if hasattr(self, "headers") else ""
+        return self.server.app.client_ip(peer, header)
+
     def _rate_allowed(self, path):
-        token = self._bearer()
-        remote = str(self.client_address[0]) if self.client_address else ""
-        principal = self.server.app.principal(token, remote)
-        allowed, retry_after = self.server.app.limiter.check(path, principal)
+        client_key = self.server.app.client_key(self._client_ip())
+        allowed, retry_after = self.server.app.limiter.check(path, client_key)
         if allowed:
             return True
         self._send(429, {"error": "rate_limited"},
                    (("Retry-After", str(max(1, int(math.ceil(retry_after))))),),
                    head_only=(getattr(self, "command", "") == "HEAD"))
+        return False
+
+    def _restart_rate_allowed(self):
+        allowed, retry_after = self.server.app.limiter.check_restart()
+        if allowed:
+            return True
+        self._send(
+            429,
+            {"error": "rate_limited"},
+            (("Retry-After", str(max(1, int(math.ceil(retry_after))))),),
+        )
         return False
 
     def _not_found_or_method(self, path, head_only=False):
@@ -425,6 +536,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             status, payload = self.server.app.health()
             self._send(status, payload, head_only=head_only)
+            return
+        if path == "/source":
+            self._send(200, self.server.app.source_payload(), head_only=head_only)
             return
         if path == "/token":
             token = self._bearer()
@@ -453,12 +567,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "unauthorized"},
                            (("WWW-Authenticate", 'Bearer realm="qr-api"'),))
                 return
+            if not self._restart_rate_allowed():
+                return
             try:
-                nonce = self.server.app.write_restart()
+                status, payload = self.server.app.request_restart()
             except OSError:
                 self._send(503, {"error": "unavailable"})
                 return
-            self._send(200, {"ok": True, "restart_nonce": nonce})
+            self._send(status, payload)
             return
         self._not_found_or_method(path)
 
@@ -526,11 +642,27 @@ class BoundedExecutor:
                 return False
             return True
 
-    def shutdown(self, wait=True):
+    def shutdown(self, wait=True, cancel_pending=None):
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+        if cancel_pending is not None:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if item is not _SENTINEL:
+                        _fn, args = item
+                        try:
+                            cancel_pending(*args)
+                        except Exception as exc:
+                            if self._error_handler is not None:
+                                self._error_handler(exc)
+                finally:
+                    self._queue.task_done()
         for _ in self._threads:
             self._queue.put(_SENTINEL)
         if wait:
@@ -602,6 +734,8 @@ class BoundedHTTPServer(HTTPServer):
             "Connection: close",
         ]
         lines.extend("{}: {}".format(name, value) for name, value in SECURITY_HEADERS)
+        lines.append("Link: <{}>; rel=\"source\"".format(SOURCE_URL))
+        lines.append("X-Source-Revision: {}".format(self.app.config.source_revision))
         response = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
         try:
             request.settimeout(min(self.socket_timeout, 0.05))
@@ -610,11 +744,15 @@ class BoundedHTTPServer(HTTPServer):
             pass
         self.app.log_server_event("server_busy", client_address[0])
 
+    def _cancel_pending_request(self, request, client_address):
+        del client_address
+        self.shutdown_request(request)
+
     def server_close(self):
         try:
             super().server_close()
         finally:
-            self._executor.shutdown()
+            self._executor.shutdown(cancel_pending=self._cancel_pending_request)
 
 
 def make_server(config: ApiConfig, server_address=None,

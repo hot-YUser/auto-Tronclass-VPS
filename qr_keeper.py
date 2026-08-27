@@ -20,13 +20,14 @@ import signal
 import socket
 import threading
 import time
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from qr_common import ConfigError, env_choice, env_float, env_int, env_text
+from qr_common import ConfigError, env_bool, env_choice, env_float, env_int, env_text
 from qr_common import env_utc_date, validate_token_record
 from qr_common import write_json_atomic as _write_json_atomic
 
@@ -37,6 +38,7 @@ class KeeperConfig:
     course_id: str
     teacher_user: str
     teacher_pass: str
+    source_revision: str
     poll_seconds: float
     workdir: str
     passive_check_seconds: float
@@ -48,6 +50,11 @@ class KeeperConfig:
     stale_ms: int
     future_skew_ms: int
     socket_timeout_seconds: float
+    corpus_enabled: bool
+    corpus_max_bytes: int
+    corpus_max_days: int
+    corpus_min_free_bytes: int
+    corpus_flush_records: int
 
 
 class AuthenticationLost(RuntimeError):
@@ -59,8 +66,12 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
     base = env_text(values, "QR_BASE", "https://www.tronclass.com.tw", required=True).rstrip("/")
     parsed = urllib.parse.urlsplit(base)
     if parsed.scheme not in ("http", "https") or not parsed.hostname \
-            or parsed.username is not None or parsed.password is not None:
+            or parsed.username is not None or parsed.password is not None \
+            or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
         raise ConfigError("QR_BASE must be an http(s) origin without credentials")
+    workdir = env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True)
+    if not (os.path.isabs(workdir) or workdir.startswith("/")):
+        raise ConfigError("QR_WORKDIR must be absolute")
     course_id = str(env_int(values, "QR_COURSE_ID", 0, minimum=1))
     preserve_mode = env_choice(
         values, "QR_PRESERVE_MODE", "auto", ("on", "off", "auto"))
@@ -69,14 +80,18 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
     duration = env_text(values, "QR_ROLLCALL_DURATION_SECONDS", default="")
     if duration and (not duration.isdigit() or int(duration) <= 0):
         raise ConfigError("QR_ROLLCALL_DURATION_SECONDS must be a positive integer")
+    source_revision = env_text(values, "QR_SOURCE_REVISION", required=True).lower()
+    if SOURCE_REVISION_RE.fullmatch(source_revision) is None:
+        raise ConfigError("QR_SOURCE_REVISION must be a 40-character commit SHA")
     return KeeperConfig(
         base=base,
         course_id=course_id,
         teacher_user=env_text(values, "QR_TEACHER_USER", required=True),
         teacher_pass=env_text(values, "QR_TEACHER_PASS", required=True),
+        source_revision=source_revision,
         poll_seconds=env_float(values, "QR_POLL_SECONDS", 0.5,
                                minimum=0.0, minimum_exclusive=True),
-        workdir=env_text(values, "QR_WORKDIR", "/home/opc/qr-harvest", required=True),
+        workdir=workdir,
         passive_check_seconds=env_float(
             values, "QR_PASSIVE_CHECK_SECONDS", 5.0,
             minimum=0.0, minimum_exclusive=True),
@@ -93,7 +108,19 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
         future_skew_ms=env_int(values, "QR_FUTURE_SKEW_MS", 1000, minimum=0),
         socket_timeout_seconds=env_float(
             values, "QR_SOCKET_TIMEOUT_SECONDS", 20.0,
-            minimum=0.0, minimum_exclusive=True, maximum=300.0),
+            minimum=0.0, minimum_exclusive=True, maximum=25.0),
+        corpus_enabled=env_bool(values, "QR_CORPUS_ENABLED", False),
+        corpus_max_bytes=env_int(
+            values, "QR_CORPUS_MAX_BYTES", 15 * 1024 ** 3,
+            minimum=1024 * 1024),
+        corpus_max_days=env_int(
+            values, "QR_CORPUS_MAX_DAYS", 30, minimum=1, maximum=3650),
+        corpus_min_free_bytes=env_int(
+            values, "QR_CORPUS_MIN_FREE_BYTES", 5 * 1024 ** 3,
+            minimum=0),
+        corpus_flush_records=env_int(
+            values, "QR_CORPUS_FLUSH_RECORDS", 20,
+            minimum=1, maximum=10000),
     )
 
 
@@ -101,6 +128,7 @@ BASE = "https://www.tronclass.com.tw"
 COURSE_ID = ""
 TEACHER_USER = ""
 TEACHER_PASS = ""
+SOURCE_REVISION = ""
 POLL_SECONDS = 0.5
 WORKDIR = "/home/opc/qr-harvest"
 PASSIVE_CHECK_SECONDS = 5.0
@@ -112,14 +140,24 @@ PRESERVE_AFTER = ""
 STALE_MS = 3000
 FUTURE_SKEW_MS = 1000
 SOCKET_TIMEOUT_SECONDS = 20.0
+CORPUS_ENABLED = False
+CORPUS_MAX_BYTES = 15 * 1024 ** 3
+CORPUS_MAX_DAYS = 30
+CORPUS_MIN_FREE_BYTES = 5 * 1024 ** 3
+CORPUS_FLUSH_RECORDS = 20
+MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
+MAX_JSON_BYTES = 1024 * 1024
 
 COOKIE_PATH = os.path.join(WORKDIR, "cookies.txt")
 TOKEN_PATH = os.path.join(WORKDIR, "token.json")
 STATE_PATH = os.path.join(WORKDIR, "state.json")
 CONTROL_PATH = os.path.join(WORKDIR, "control.json")
+CONTROL_ACK_PATH = os.path.join(WORKDIR, "control-ack.json")
 RID_PATH = os.path.join(WORKDIR, "rollcall.json")
 
+CONTROL_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 FORM_JSON_RE = re.compile(r":email-login-form\s*=\s*(['\"])(.*?)\1", re.S)
+SOURCE_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 HIDDEN_RE = re.compile(r"email-login-hidden-tag\s*=\s*(['\"])(.*?)\1", re.S)
 
 os.umask(0o077)
@@ -146,15 +184,18 @@ STATE = {
 
 
 def apply_config(config: KeeperConfig) -> None:
-    global BASE, COURSE_ID, TEACHER_USER, TEACHER_PASS, POLL_SECONDS, WORKDIR
+    global BASE, COURSE_ID, TEACHER_USER, TEACHER_PASS, SOURCE_REVISION, POLL_SECONDS, WORKDIR
     global PASSIVE_CHECK_SECONDS, STATE_WRITE_SECONDS, COOKIE_RESAVE_SECONDS
     global _ROLLCALL_DURATION_ENV, PRESERVE_MODE, PRESERVE_AFTER
     global STALE_MS, FUTURE_SKEW_MS, SOCKET_TIMEOUT_SECONDS
-    global COOKIE_PATH, TOKEN_PATH, STATE_PATH, CONTROL_PATH, RID_PATH
+    global CORPUS_ENABLED, CORPUS_MAX_BYTES, CORPUS_MAX_DAYS
+    global CORPUS_MIN_FREE_BYTES, CORPUS_FLUSH_RECORDS
+    global COOKIE_PATH, TOKEN_PATH, STATE_PATH, CONTROL_PATH, CONTROL_ACK_PATH, RID_PATH
     BASE = config.base
     COURSE_ID = config.course_id
     TEACHER_USER = config.teacher_user
     TEACHER_PASS = config.teacher_pass
+    SOURCE_REVISION = config.source_revision
     POLL_SECONDS = config.poll_seconds
     WORKDIR = config.workdir
     PASSIVE_CHECK_SECONDS = config.passive_check_seconds
@@ -166,10 +207,16 @@ def apply_config(config: KeeperConfig) -> None:
     STALE_MS = config.stale_ms
     FUTURE_SKEW_MS = config.future_skew_ms
     SOCKET_TIMEOUT_SECONDS = config.socket_timeout_seconds
+    CORPUS_ENABLED = config.corpus_enabled
+    CORPUS_MAX_BYTES = config.corpus_max_bytes
+    CORPUS_MAX_DAYS = config.corpus_max_days
+    CORPUS_MIN_FREE_BYTES = config.corpus_min_free_bytes
+    CORPUS_FLUSH_RECORDS = config.corpus_flush_records
     COOKIE_PATH = os.path.join(WORKDIR, "cookies.txt")
     TOKEN_PATH = os.path.join(WORKDIR, "token.json")
     STATE_PATH = os.path.join(WORKDIR, "state.json")
     CONTROL_PATH = os.path.join(WORKDIR, "control.json")
+    CONTROL_ACK_PATH = os.path.join(WORKDIR, "control-ack.json")
     RID_PATH = os.path.join(WORKDIR, "rollcall.json")
 
 
@@ -201,9 +248,14 @@ def _http_error_summary(exc):
 
 def _read_json(path):
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError, TypeError):
+        if os.path.islink(path) or os.path.getsize(path) > MAX_JSON_BYTES:
+            return None
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_JSON_BYTES + 1)
+        if len(raw) > MAX_JSON_BYTES:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
         return None
 
 
@@ -228,13 +280,47 @@ def _load_jar(path):
 
 
 def _save_jar_atomic(jar, path):
-    tmp = path + ".tmp"
-    jar.save(filename=tmp, ignore_discard=True, ignore_expires=True)
-    os.replace(tmp, path)
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=".{}-".format(os.path.basename(path)),
+        suffix=".tmp",
+        dir=parent,
+    )
+    os.close(descriptor)
+    try:
+        os.chmod(tmp, 0o600)
+        jar.save(filename=tmp, ignore_discard=True, ignore_expires=True)
+        with open(tmp, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            directory = -1
+        if directory >= 0:
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+            finally:
+                os.close(directory)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _opener(jar):
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def _read_http_text(response, limit=MAX_HTTP_BODY_BYTES):
+    raw = response.read(int(limit) + 1)
+    if len(raw) > int(limit):
+        raise RuntimeError("upstream response too large")
+    return raw.decode("utf-8", "replace")
 
 
 def _json_req(op, url, payload=None, method=None):
@@ -246,11 +332,17 @@ def _json_req(op, url, payload=None, method=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with op.open(req) as resp:
-            raw = resp.read().decode("utf-8", "replace")
+            raw = _read_http_text(resp)
             status = getattr(resp, "status", 200)
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            exc.close()
+            raise AuthenticationLost("teacher session unauthorized")
         status = exc.code
-        raw = exc.read().decode("utf-8", "replace")
+        try:
+            raw = _read_http_text(exc)
+        finally:
+            exc.close()
     try:
         return status, json.loads(raw)
     except (TypeError, ValueError):
@@ -259,16 +351,20 @@ def _json_req(op, url, payload=None, method=None):
 
 def session_valid(op):
     try:
-        check = op.open(BASE + "/api/my-courses").read().decode("utf-8", "replace")
-        return '"courses"' in check
-    except (OSError, urllib.error.URLError, ValueError):
+        status, body = _json_req(op, BASE + "/api/my-courses")
+    except AuthenticationLost:
         return False
+    if status != 200 or not isinstance(body, dict):
+        return False
+    courses = body.get("courses")
+    return isinstance(courses, list)
 
 
 def login(user, passwd, jar):
     """Open a teacher email session and keep cookies in the supplied jar."""
     op = _opener(jar)
-    page = op.open(BASE + "/login").read().decode("utf-8", "replace")
+    with op.open(BASE + "/login") as response:
+        page = _read_http_text(response)
     mj = FORM_JSON_RE.search(page)
     mh = HIDDEN_RE.search(page)
     fields = {}
@@ -293,7 +389,8 @@ def login(user, passwd, jar):
     if nxt:
         url += "&next=" + urllib.parse.quote(nxt)
     req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
-    op.open(req).read()
+    with op.open(req) as response:
+        _read_http_text(response)
     if not session_valid(op):
         raise AuthenticationLost("login validation failed")
     return op
@@ -359,8 +456,19 @@ def create_rollcall(op):
         if not rid:
             last_status = status
             continue
-        _json_req(op, BASE + "/api/rollcall/{}/start-rollcall".format(rid),
-                  {"duration": duration} if duration > 0 else None, "POST")
+        start_status, _start_body = _json_req(
+            op,
+            BASE + "/api/rollcall/{}/start-rollcall".format(rid),
+            {"duration": duration} if duration > 0 else None,
+            "POST",
+        )
+        if start_status not in (200, 201, 204):
+            last_status = start_status
+            try:
+                stop_rollcall(op, rid)
+            except (OSError, urllib.error.URLError, AuthenticationLost):
+                pass
+            continue
         _set(rollcall_duration=duration)
         return rid
     raise RuntimeError("create rollcall failed (HTTP {})".format(last_status))
@@ -369,7 +477,7 @@ def create_rollcall(op):
 def _record_rollcall_meta(op, rid):
     try:
         for row in list_rollcalls(op):
-            if str(row.get("id")) == str(rid):
+            if extract_rollcall_id(row) == str(rid):
                 _set(rollcall_finished_at=str(row.get("end_time") or ""),
                      rollcall_status=str(row.get("status") or ""))
                 return True
@@ -390,19 +498,52 @@ def live_qr_rollcall(op):
     for row in list_rollcalls(op):
         if str(row.get("status", "")) == "in_progress" and \
                 str(row.get("type", "")) in ("qr_rollcall", "qr"):
-            return str(row.get("id") or "")
+            return extract_rollcall_id(row)
     return ""
 
 
 def stop_rollcall(op, rid):
-    _json_req(op, BASE + "/api/rollcall/{}/stop_qr_rollcall".format(rid),
-              payload=None, method="PUT")
+    status, _body = _json_req(
+        op,
+        BASE + "/api/rollcall/{}/stop_qr_rollcall".format(rid),
+        payload=None,
+        method="PUT",
+    )
+    return status in (200, 201, 204)
+
+
+def _rollcall_in_progress(op, rid):
+    status, body = _json_req(
+        op, BASE + "/api/course/{}/rollcalls".format(COURSE_ID))
+    if status != 200 or not isinstance(body, dict):
+        return None
+    rows = body.get("rollcalls")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict) and extract_rollcall_id(row) == str(rid):
+            return str(row.get("status") or "") == "in_progress"
+    return False
+
+
+def _wait_rollcall_closed(op, rid, timeout_seconds=10.0):
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    while not STOP_EVENT.is_set() and time.monotonic() < deadline:
+        state = _rollcall_in_progress(op, rid)
+        if state is False:
+            return True
+        STOP_EVENT.wait(0.2)
+    return False
 
 
 def _save_rid(rid):
     _set(rollcall_id=rid)
     try:
-        _write_json_atomic(RID_PATH, {"rollcall_id": rid, "saved_utc": _now_utc()})
+        _write_json_atomic(
+            RID_PATH,
+            {"rollcall_id": rid, "saved_utc": _now_utc()},
+            durable=True,
+        )
     except OSError:
         pass
 
@@ -432,19 +573,117 @@ def _write_token(data, rid, now_ms=None):
     return checked
 
 
-def _control_nonce():
-    rec = _read_json(CONTROL_PATH)
-    return str((rec or {}).get("nonce") or "") if isinstance(rec, dict) else ""
+def _control_request():
+    record = _read_json(CONTROL_PATH)
+    if not isinstance(record, dict) or record.get("version") != 1 \
+            or record.get("cmd") != "restart":
+        return None
+    request_id = record.get("request_id")
+    created = record.get("created_epoch_ms")
+    if not isinstance(request_id, str) or CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
+        return None
+    if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
+        return None
+    return {
+        "version": 1,
+        "cmd": "restart",
+        "request_id": request_id,
+        "created_epoch_ms": created,
+    }
+
+
+def _control_ack():
+    record = _read_json(CONTROL_ACK_PATH)
+    return record if isinstance(record, dict) else None
+
+
+def _restart_request_pending():
+    request = _control_request()
+    if request is None:
+        return None
+    ack = _control_ack()
+    if isinstance(ack, dict) and ack.get("request_id") == request["request_id"] \
+            and ack.get("status") in {"completed", "rejected_preserve", "failed"}:
+        return None
+    return request
+
+
+def _write_control_ack(request, status, *, rollcall_id="", error=""):
+    if status not in {"accepted", "completed", "rejected_preserve", "failed"}:
+        raise ValueError("invalid control ack status")
+    record = {
+        "version": 1,
+        "request_id": request["request_id"],
+        "status": status,
+        "updated_utc": _now_utc(),
+    }
+    if rollcall_id:
+        record["rollcall_id"] = str(rollcall_id)
+    if error:
+        record["error"] = str(error)[:80]
+    _write_json_atomic(
+        CONTROL_ACK_PATH,
+        record,
+        durable=True,
+        separators=(",", ":"),
+    )
+    return record
+
+
+def _restart_rollcall(op, rid, request):
+    """Stop the current source, confirm closure, and create a distinct replacement."""
+    try:
+        _write_control_ack(request, "accepted", rollcall_id=rid)
+        old_rid = str(rid or "")
+        if old_rid:
+            state = _rollcall_in_progress(op, old_rid)
+            if state is None:
+                _write_control_ack(request, "failed", error="status_unavailable")
+                return rid, None
+            if state:
+                if not stop_rollcall(op, old_rid):
+                    _write_control_ack(request, "failed", error="stop_failed")
+                    return rid, None
+                if not _wait_rollcall_closed(op, old_rid):
+                    _write_control_ack(request, "failed", error="close_timeout")
+                    return rid, None
+        new_rid = create_rollcall(op)
+        if not new_rid or new_rid == old_rid:
+            _write_control_ack(request, "failed", error="replacement_not_created")
+            return "", None
+        _save_rid(new_rid)
+        with LOCK:
+            STATE["recreated"] = STATE.get("recreated", 0) + 1
+        return new_rid, {"request": request, "old_rollcall_id": old_rid}
+    except Exception as exc:
+        try:
+            _write_control_ack(
+                request,
+                "failed",
+                error=_http_error_summary(exc),
+            )
+        except OSError:
+            pass
+        return "", None
 
 
 class Corpus:
-    """Daily rotating gzip JSONL corpus with bounded storage."""
+    """Opt-in daily gzip JSONL corpus with age, size, and free-space bounds."""
 
     def __init__(self):
         self.f = None
+        self.path = ""
         self.day = ""
         self.bytes = 0
         self.pending = 0
+        self.disabled = not CORPUS_ENABLED
+        if self.disabled:
+            _set(corpus_bytes=0)
+
+    def disable(self):
+        self.disabled = True
+        self.close()
+        _set(corpus_bytes=0)
 
     def close(self):
         if self.f is not None:
@@ -454,39 +693,78 @@ class Corpus:
                 self.f.close()
                 self.f = None
 
-    def _prune(self):
-        files = sorted(f for f in os.listdir(WORKDIR)
-                       if re.fullmatch(r"tokens-\d{8}\.jsonl\.gz", f))
-        total = sum(os.path.getsize(os.path.join(WORKDIR, f)) for f in files)
-        for filename in list(files):
-            if total <= 15 * 1024 ** 3 or len(files) == 1:
+    @staticmethod
+    def _files():
+        files = []
+        for filename in os.listdir(WORKDIR):
+            if re.fullmatch(r"tokens-\d{8}\.jsonl\.gz", filename):
+                path = os.path.join(WORKDIR, filename)
+                try:
+                    files.append((filename, path, os.path.getsize(path)))
+                except OSError:
+                    continue
+        return sorted(files)
+
+    def _prune(self, protected_path=""):
+        files = self._files()
+        cutoff = time.strftime(
+            "%Y%m%d",
+            time.gmtime(time.time() - max(0, CORPUS_MAX_DAYS - 1) * 86400),
+        )
+        for filename, path, _size in list(files):
+            day = filename[7:15]
+            if day < cutoff:
+                os.remove(path)
+                files.remove((filename, path, _size))
+        total = sum(size for _filename, _path, size in files)
+        for item in list(files):
+            if total <= CORPUS_MAX_BYTES:
                 break
-            path = os.path.join(WORKDIR, filename)
-            total -= os.path.getsize(path)
+            _filename, path, size = item
+            if protected_path and os.path.abspath(path) == os.path.abspath(protected_path):
+                continue
             os.remove(path)
-            files.remove(filename)
+            total -= size
+            files.remove(item)
+        return total
 
     def _open_day(self):
         self.close()
         self._prune()
         self.day = time.strftime("%Y%m%d", time.gmtime())
-        path = os.path.join(WORKDIR, "tokens-{}.jsonl.gz".format(self.day))
-        self.f = gzip.open(path, "at", encoding="utf-8")
-        self.bytes = os.path.getsize(path)
+        self.path = os.path.join(WORKDIR, "tokens-{}.jsonl.gz".format(self.day))
+        self.f = gzip.open(self.path, "at", encoding="utf-8")
+        self.bytes = os.path.getsize(self.path)
         self.pending = 0
 
+    def _flush_and_bound(self):
+        self.f.flush()
+        self.pending = 0
+        current_size = os.path.getsize(self.path)
+        total = self._prune(protected_path=self.path)
+        if current_size > CORPUS_MAX_BYTES or total > CORPUS_MAX_BYTES:
+            self.close()
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            self.disable()
+            return False
+        self.bytes = current_size
+        _set(corpus_bytes=total)
+        return True
+
     def write(self, line):
+        if self.disabled:
+            return
+        if shutil.disk_usage(WORKDIR).free < CORPUS_MIN_FREE_BYTES:
+            return
         if self.f is None or self.day != time.strftime("%Y%m%d", time.gmtime()):
             self._open_day()
-        if shutil.disk_usage(WORKDIR).free < 5 * 1024 ** 3:
-            return
         self.f.write(line + "\n")
-        self.bytes += len(line.encode("utf-8")) + 1
         self.pending += 1
-        if self.pending >= 20:
-            self.f.flush()
-            self.pending = 0
-        _set(corpus_bytes=self.bytes)
+        if self.pending >= CORPUS_FLUSH_RECORDS:
+            self._flush_and_bound()
 
 
 def harvester():
@@ -496,22 +774,18 @@ def harvester():
     backoff = 1.0
     corpus = Corpus()
     last_cookie_save = 0.0
-    last_ctrl = _control_nonce()
     last_meta_rid = ""
+    previous_preserve = False
+    restart_pending = None
     try:
         while not STOP_EVENT.is_set():
             preserve = preserve_active()
             _set(preserve=preserve)
             try:
-                ctrl = _control_nonce()
-                if ctrl != last_ctrl:
-                    last_ctrl = ctrl
-                    if not preserve and op is not None and rid:
-                        try:
-                            stop_rollcall(op, rid)
-                        except (OSError, urllib.error.URLError):
-                            pass
-                        rid = ""
+                if preserve and not previous_preserve and jar is not None:
+                    _save_jar_atomic(jar, COOKIE_PATH)
+                    last_cookie_save = time.time()
+                previous_preserve = preserve
 
                 if op is None:
                     jar = _load_jar(COOKIE_PATH)
@@ -534,6 +808,23 @@ def harvester():
                     if rid:
                         _save_rid(rid)
 
+                request = _restart_request_pending()
+                request_id = request.get("request_id") if isinstance(request, dict) else ""
+                pending_id = restart_pending["request"]["request_id"] \
+                    if isinstance(restart_pending, dict) else ""
+                if request_id and request_id != pending_id:
+                    if preserve:
+                        _write_control_ack(
+                            request,
+                            "rejected_preserve",
+                            rollcall_id=rid,
+                        )
+                    else:
+                        rid, restart_pending = _restart_rollcall(op, rid, request)
+                        last_meta_rid = ""
+                        if not rid:
+                            raise RuntimeError("restart source recovery pending")
+
                 if rid and rid != last_meta_rid and _record_rollcall_meta(op, rid):
                     last_meta_rid = rid
 
@@ -547,8 +838,20 @@ def harvester():
                 with LOCK:
                     STATE.update(last_fetch_utc=_now_utc(), age_ms=checked.age_ms,
                                  rollcall_id=rid, ok=True, last_error="")
-                corpus.write(json.dumps(
-                    {"utc": _now_utc(), "ts": ts, "data": data}, separators=(",", ":")))
+                if isinstance(restart_pending, dict):
+                    _write_control_ack(
+                        restart_pending["request"],
+                        "completed",
+                        rollcall_id=rid,
+                    )
+                    restart_pending = None
+                try:
+                    corpus.write(json.dumps(
+                        {"utc": _now_utc(), "ts": ts, "data": data}, separators=(",", ":")))
+                except Exception as exc:
+                    corpus.disable()
+                    _set(corpus_bytes=0)
+                    print("corpus disabled: {}".format(type(exc).__name__), flush=True)
 
                 if not preserve and jar is not None and \
                         time.time() - last_cookie_save > COOKIE_RESAVE_SECONDS:
@@ -613,19 +916,43 @@ def _request_stop(signum, frame):
     STOP_EVENT.set()
 
 
+def _run_supervised(name, target):
+    try:
+        target()
+    except BaseException as exc:
+        _set(ok=False, last_error="{}_stopped".format(name))
+        print("{} stopped: {}".format(name, type(exc).__name__), flush=True)
+    finally:
+        if not STOP_EVENT.is_set():
+            STOP_EVENT.set()
+
+
 def main():
     config = load_config()
     apply_config(config)
     socket.setdefaulttimeout(SOCKET_TIMEOUT_SECONDS)
     os.makedirs(WORKDIR, mode=0o700, exist_ok=True)
     STOP_EVENT.clear()
-    _set(started_utc=_now_utc(), ok=False, last_error="")
+    _set(started_utc=_now_utc(), ok=False, last_error="",
+         source_revision=SOURCE_REVISION)
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)
     threads = [
-        threading.Thread(target=harvester, name="harvester"),
-        threading.Thread(target=passive_check, name="passive-check"),
-        threading.Thread(target=state_writer, name="state-writer"),
+        threading.Thread(
+            target=_run_supervised,
+            args=("harvester", harvester),
+            name="harvester",
+        ),
+        threading.Thread(
+            target=_run_supervised,
+            args=("passive_check", passive_check),
+            name="passive-check",
+        ),
+        threading.Thread(
+            target=_run_supervised,
+            args=("state_writer", state_writer),
+            name="state-writer",
+        ),
     ]
     for thread in threads:
         thread.start()
