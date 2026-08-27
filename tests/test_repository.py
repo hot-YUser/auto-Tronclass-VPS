@@ -29,7 +29,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         paths = tracked_files()
         forbidden_names = {
             "secrets.env", "cookies.txt", "cookies-student.txt", "token.json",
-            "state.json", "control.json", "rollcall.json", "apikeys.json",
+            "state.json", "control.json", "control-ack.json", "rollcall.json", "apikeys.json",
         }
         for path in paths:
             text = path.as_posix()
@@ -64,6 +64,8 @@ class RepositoryHygieneTests(unittest.TestCase):
         api = env_names("api.env.example")
         keeper = env_names("keeper.env.example")
         self.assertIn("QR_API_KEY", api)
+        self.assertIn("QR_SOURCE_REVISION", api)
+        self.assertIn("QR_SOURCE_REVISION", keeper)
         self.assertTrue({"QR_TEACHER_USER", "QR_TEACHER_PASS"}.issubset(keeper))
         self.assertTrue(api.isdisjoint({"QR_TEACHER_USER", "QR_TEACHER_PASS"}))
         self.assertTrue(keeper.isdisjoint({
@@ -71,6 +73,16 @@ class RepositoryHygieneTests(unittest.TestCase):
             "QR_API_PENDING", "QR_GLOBAL_RATE", "QR_PRINCIPAL_RATE",
         }))
         self.assertFalse(any(name.startswith("QR_STUDENT_") for name in api | keeper))
+
+    def test_ci_actions_are_pinned_to_exact_commits(self):
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        uses = [line.strip().split("uses:", 1)[1].strip().split()[0]
+                for line in text.splitlines() if "uses:" in line]
+        self.assertTrue(uses)
+        for reference in uses:
+            with self.subTest(reference=reference):
+                revision = reference.rsplit("@", 1)[-1]
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
     def test_systemd_units_are_separate_explicit_and_hardened(self):
         expected_env = {
@@ -80,6 +92,29 @@ class RepositoryHygieneTests(unittest.TestCase):
         required = (
             "UMask=0077",
             "NoNewPrivileges=true",
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "ReadWritePaths=/home/opc/qr-harvest",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelLogs=true",
+            "ProtectControlGroups=true",
+            "ProtectClock=true",
+            "ProtectHostname=true",
+            "ProtectProc=invisible",
+            "ProcSubset=pid",
+            "RestrictNamespaces=true",
+            "RestrictSUIDSGID=true",
+            "RestrictRealtime=true",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "LockPersonality=true",
+            "MemoryDenyWriteExecute=true",
+            "SystemCallArchitectures=native",
+            "RemoveIPC=true",
             "TasksMax=64",
             "MemoryMax=256M",
             "LimitNOFILE=1024",
@@ -92,6 +127,11 @@ class RepositoryHygieneTests(unittest.TestCase):
                 self.assertIn("WorkingDirectory=/home/opc/qr-harvest", text)
                 self.assertIn("EnvironmentFile={}".format(environment_file), text)
                 self.assertIn("ExecStart=/usr/bin/python3 /home/opc/qr-harvest/", text)
+                read_only = next(
+                    line for line in text.splitlines() if line.startswith("ReadOnlyPaths=")
+                )
+                for source in ("qr_api.py", "qr_keeper.py", "qr_keys.py", "qr_common.py"):
+                    self.assertIn("/home/opc/qr-harvest/" + source, read_only)
                 self.assertNotIn("/bin/sh", text)
                 for directive in required:
                     self.assertIn(directive, text)
