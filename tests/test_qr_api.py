@@ -405,12 +405,13 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual("accepted", payload["status"])
         self.assertEqual("restart-nonce-1234", payload["request_id"])
         self.assertEqual("restart-nonce-1234", payload["restart_nonce"])
-        self.assertEqual({
-            "version": 1,
-            "cmd": "restart",
-            "request_id": "restart-nonce-1234",
-            "created_epoch_ms": 2_000_000_000_500,
-        }, json.loads((self.root / "control.json").read_text(encoding="utf-8")))
+        control = json.loads((self.root / "control.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, control["version"])
+        self.assertEqual("restart", control["cmd"])
+        self.assertEqual("restart-nonce-1234", control["request_id"])
+        self.assertEqual(2_000_000_000_500, control["created_epoch_ms"])
+        # Legacy compat: must remain consumable by old keeper.
+        self.assertEqual("2000000000500", control["nonce"])
         self.assert_security_headers(headers)
 
     def test_restart_rejects_preserve_and_existing_pending_request(self):

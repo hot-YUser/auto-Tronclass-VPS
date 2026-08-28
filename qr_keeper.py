@@ -156,6 +156,7 @@ CONTROL_ACK_PATH = os.path.join(WORKDIR, "control-ack.json")
 RID_PATH = os.path.join(WORKDIR, "rollcall.json")
 
 CONTROL_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+LEGACY_NONCE_RE = re.compile(r"[0-9]{10,15}\Z")
 FORM_JSON_RE = re.compile(r":email-login-form\s*=\s*(['\"])(.*?)\1", re.S)
 SOURCE_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 HIDDEN_RE = re.compile(r"email-login-hidden-tag\s*=\s*(['\"])(.*?)\1", re.S)
@@ -573,23 +574,53 @@ def _write_token(data, rid, now_ms=None):
     return checked
 
 
+
+def _normalize_control_record(record):
+    """Normalize legacy nonce or new versioned control records.
+
+    Returns a canonical versioned dict or None. Accepts:
+      - new: {"version":1,"cmd":"restart","request_id":...,"created_epoch_ms":...}
+      - legacy: {"cmd":"restart","nonce":"<digits>"}
+    Rejects arbitrary malformed records (missing keys, wrong types, or nonce/request_id not matching allowlisted patterns).
+    """
+    if not isinstance(record, dict) or record.get("cmd") != "restart":
+        return None
+    version = record.get("version")
+    if isinstance(version, int) and not isinstance(version, bool) and version == 1:
+        request_id = record.get("request_id")
+        created = record.get("created_epoch_ms")
+        if not isinstance(request_id, str) or CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
+            return None
+        if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
+            return None
+        return {
+            "version": 1,
+            "cmd": "restart",
+            "request_id": request_id,
+            "created_epoch_ms": created,
+        }
+    if version is None:
+        nonce = record.get("nonce")
+        if not isinstance(nonce, str) or LEGACY_NONCE_RE.fullmatch(nonce) is None:
+            return None
+        # Nonce-only legacy record: normalize to versioned form using nonce as request_id.
+        try:
+            created = int(nonce)
+        except (TypeError, ValueError):
+            return None
+        if created <= 0:
+            return None
+        return {
+            "version": 1,
+            "cmd": "restart",
+            "request_id": nonce,
+            "created_epoch_ms": created,
+        }
+    return None
+
+
 def _control_request():
-    record = _read_json(CONTROL_PATH)
-    if not isinstance(record, dict) or record.get("version") != 1 \
-            or record.get("cmd") != "restart":
-        return None
-    request_id = record.get("request_id")
-    created = record.get("created_epoch_ms")
-    if not isinstance(request_id, str) or CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
-        return None
-    if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
-        return None
-    return {
-        "version": 1,
-        "cmd": "restart",
-        "request_id": request_id,
-        "created_epoch_ms": created,
-    }
+    return _normalize_control_record(_read_json(CONTROL_PATH))
 
 
 def _control_ack():
@@ -714,7 +745,13 @@ class Corpus:
         for filename, path, _size in list(files):
             day = filename[7:15]
             if day < cutoff:
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    files.remove((filename, path, _size))
+                    continue
+                except (PermissionError, OSError):
+                    raise
                 files.remove((filename, path, _size))
         total = sum(size for _filename, _path, size in files)
         for item in list(files):
@@ -723,7 +760,13 @@ class Corpus:
             _filename, path, size = item
             if protected_path and os.path.abspath(path) == os.path.abspath(protected_path):
                 continue
-            os.remove(path)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                files.remove(item)
+                continue
+            except (PermissionError, OSError):
+                raise
             total -= size
             files.remove(item)
         return total
@@ -757,8 +800,18 @@ class Corpus:
     def write(self, line):
         if self.disabled:
             return
+        # Allow a bounded prune/recheck before declining due to low space.
         if shutil.disk_usage(WORKDIR).free < CORPUS_MIN_FREE_BYTES:
-            return
+            try:
+                total = self._prune(protected_path=self.path if self.path else "")
+            except (PermissionError, OSError):
+                self.disable()
+                _set(corpus_bytes=0)
+                print("corpus disabled: prune failed", flush=True)
+                return
+            if shutil.disk_usage(WORKDIR).free < CORPUS_MIN_FREE_BYTES:
+                _set(corpus_bytes=total)
+                return
         if self.f is None or self.day != time.strftime("%Y%m%d", time.gmtime()):
             self._open_day()
         self.f.write(line + "\n")
@@ -870,18 +923,41 @@ def harvester():
                     _set(preserve_alert=_now_utc())
                 print("harvest error: {} (backoff {}s, preserve={})".format(
                     msg, backoff, preserve), flush=True)
-                auth_loss = (isinstance(exc, urllib.error.HTTPError)
-                             and exc.code in (401, 403)) \
-                    or isinstance(exc, AuthenticationLost)
-                if auth_loss:
+                recoverable = False
+                try:
+                    raise exc
+                except AuthenticationLost:
                     op = None
                     rid = ""
-                else:
+                    recoverable = True
+                except urllib.error.HTTPError as http_exc:
+                    if http_exc.code in (401, 403):
+                        op = None
+                        rid = ""
+                        recoverable = True
+                    else:
+                        pass
+                except (OSError, urllib.error.URLError):
+                    recoverable = True
+                except Exception:
+                    pass
+                if not recoverable:
                     try:
                         if op is not None and rid and not live_qr_rollcall(op):
                             rid = ""
+                            recoverable = True
+                    except AuthenticationLost:
+                        op = None
+                        rid = ""
+                        recoverable = True
                     except (OSError, urllib.error.URLError):
                         op = None
+                        recoverable = True
+                    except Exception:
+                        pass
+                if not recoverable:
+                    # Non-auth, non-network: keep harvester alive via backoff without crashing.
+                    _set(ok=False, last_error=msg)
                 STOP_EVENT.wait(backoff)
                 backoff = min(backoff * 2, 60.0)
     finally:

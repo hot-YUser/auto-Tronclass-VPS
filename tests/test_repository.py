@@ -63,16 +63,18 @@ class RepositoryHygieneTests(unittest.TestCase):
     def test_environment_examples_separate_service_secrets(self):
         api = env_names("api.env.example")
         keeper = env_names("keeper.env.example")
+        common = env_names("common.env.example")
         self.assertIn("QR_API_KEY", api)
-        self.assertIn("QR_SOURCE_REVISION", api)
-        self.assertIn("QR_SOURCE_REVISION", keeper)
+        self.assertIn("QR_SOURCE_REVISION", common)
         self.assertTrue({"QR_TEACHER_USER", "QR_TEACHER_PASS"}.issubset(keeper))
         self.assertTrue(api.isdisjoint({"QR_TEACHER_USER", "QR_TEACHER_PASS"}))
         self.assertTrue(keeper.isdisjoint({
             "QR_API_KEY", "QR_BIND", "QR_PORT", "QR_API_WORKERS",
             "QR_API_PENDING", "QR_GLOBAL_RATE", "QR_PRINCIPAL_RATE",
         }))
-        self.assertFalse(any(name.startswith("QR_STUDENT_") for name in api | keeper))
+        # Shared non-secret env must not leak into secret files; secrets remain disjoint.
+        self.assertTrue(common.isdisjoint({"QR_API_KEY", "QR_TEACHER_USER", "QR_TEACHER_PASS", "QR_BIND", "QR_PORT"}))
+        self.assertFalse(any(name.startswith("QR_STUDENT_") for name in api | keeper | common))
 
     def test_ci_actions_are_pinned_to_exact_commits(self):
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -86,8 +88,8 @@ class RepositoryHygieneTests(unittest.TestCase):
 
     def test_systemd_units_are_separate_explicit_and_hardened(self):
         expected_env = {
-            "qr-api.service": "/etc/qr-harvest/api.env",
-            "qr-keeper.service": "/etc/qr-harvest/keeper.env",
+            "qr-api.service": ("/etc/qr-harvest/common.env", "/etc/qr-harvest/api.env"),
+            "qr-keeper.service": ("/etc/qr-harvest/common.env", "/etc/qr-harvest/keeper.env"),
         }
         required = (
             "UMask=0077",
@@ -103,10 +105,6 @@ class RepositoryHygieneTests(unittest.TestCase):
             "ProtectKernelModules=true",
             "ProtectKernelLogs=true",
             "ProtectControlGroups=true",
-            "ProtectClock=true",
-            "ProtectHostname=true",
-            "ProtectProc=invisible",
-            "ProcSubset=pid",
             "RestrictNamespaces=true",
             "RestrictSUIDSGID=true",
             "RestrictRealtime=true",
@@ -120,12 +118,17 @@ class RepositoryHygieneTests(unittest.TestCase):
             "LimitNOFILE=1024",
             "TimeoutStopSec=30",
         )
-        for name, environment_file in expected_env.items():
+        for name, environment_files in expected_env.items():
             text = (ROOT / name).read_text(encoding="utf-8")
             with self.subTest(unit=name):
                 self.assertIn("User=opc", text)
                 self.assertIn("WorkingDirectory=/home/opc/qr-harvest", text)
-                self.assertIn("EnvironmentFile={}".format(environment_file), text)
+                for environment_file in environment_files:
+                    self.assertTrue(
+                        "EnvironmentFile={}".format(environment_file) in text
+                        or "EnvironmentFile=-{}".format(environment_file) in text,
+                        text,
+                    )
                 self.assertIn("ExecStart=/usr/bin/python3 /home/opc/qr-harvest/", text)
                 read_only = next(
                     line for line in text.splitlines() if line.startswith("ReadOnlyPaths=")
@@ -135,6 +138,9 @@ class RepositoryHygieneTests(unittest.TestCase):
                 self.assertNotIn("/bin/sh", text)
                 for directive in required:
                     self.assertIn(directive, text)
+                # OL8/systemd 239 does not support these newer directives; ensure we do not pretend they are active.
+                for legacy in ("ProtectClock=true", "ProtectHostname=true", "ProtectProc=invisible", "ProcSubset=pid"):
+                    self.assertNotIn(legacy, text)
 
 
 if __name__ == "__main__":

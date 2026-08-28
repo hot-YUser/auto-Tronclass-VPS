@@ -331,22 +331,39 @@ class ApiApplication:
             "age_ms": checked.age_ms,
         }
 
+    LEGACY_NONCE_RE = __import__("re").compile(r"[0-9]{10,15}\Z")
     def _restart_is_pending(self):
         request = _read_json(self.control_path)
-        if not isinstance(request, dict) or request.get("version") != 1 \
-                or request.get("cmd") != "restart":
+        if not isinstance(request, dict) or request.get("cmd") != "restart":
             return False
-        request_id = request.get("request_id")
-        if not isinstance(request_id, str) \
-                or _CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
-            return False
-        ack = _read_json(self.control_ack_path)
-        return not (
-            isinstance(ack, dict)
-            and ack.get("request_id") == request_id
-            and ack.get("status") in _TERMINAL_CONTROL_STATUSES
-        )
-
+        version = request.get("version")
+        if version == 1:
+            request_id = request.get("request_id")
+            if not isinstance(request_id, str) \
+                    or _CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
+                return False
+            ack = _read_json(self.control_ack_path)
+            if isinstance(ack, dict) and ack.get("status") in _TERMINAL_CONTROL_STATUSES:
+                ack_id = ack.get("request_id")
+                alias = request.get("nonce")
+                if ack_id == request_id or (isinstance(alias, str) and ack_id == alias):
+                    return False
+            return not (
+                isinstance(ack, dict)
+                and ack.get("request_id") == request_id
+                and ack.get("status") in _TERMINAL_CONTROL_STATUSES
+            )
+        if version is None:
+            nonce = request.get("nonce")
+            if not isinstance(nonce, str) or self.LEGACY_NONCE_RE.fullmatch(nonce) is None:
+                return False
+            ack = _read_json(self.control_ack_path)
+            return not (
+                isinstance(ack, dict)
+                and ack.get("request_id") == nonce
+                and ack.get("status") in _TERMINAL_CONTROL_STATUSES
+            )
+        return False
     def request_restart(self):
         state = _read_json(self.state_path)
         if isinstance(state, dict) and state.get("preserve") is True:
@@ -354,11 +371,14 @@ class ApiApplication:
         if self._restart_is_pending():
             return 409, {"error": "restart_pending"}
         request_id = secrets.token_urlsafe(18)
+        now = self.now_ms()
         request = {
             "version": 1,
             "cmd": "restart",
             "request_id": request_id,
-            "created_epoch_ms": self.now_ms(),
+            "created_epoch_ms": now,
+            # Compat: include legacy nonce alias so an old keeper (nonce-only) can still restart.
+            "nonce": str(now),
         }
         write_json_atomic(
             self.control_path,
@@ -416,6 +436,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         del code, size
+
+
+    def handle(self):
+        """Bounded handle: keep-alive loop must respect connection closure and errors."""
+        self.close_connection = True
+        try:
+            self.handle_one_request()
+            while not self.close_connection:
+                self.handle_one_request()
+        except Exception:
+            self.close_connection = True
+            try:
+                self.server.app.log_server_event("request_error", self.client_address[0] if self.client_address else "")
+            except Exception:
+                pass
 
     def handle_one_request(self):
         self._access_started = self.server.app.monotonic()
@@ -481,6 +516,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_error(self, code, message=None, explain=None):
         del message, explain
+        # Parser-generated 4xx/5xx (400/414/431/505) must be rate-limited to protect bounded workers.
+        # Avoid double-charging: only apply here for parser errors; route handlers already rate-limit.
+        # Use direct limiter check without recursion (send_error -> _rate_allowed -> _send -> send_error).
+        code_int = int(code)
+        if code_int in (400, 414, 431, 505):
+            client_key = self.server.app.client_key(self._client_ip())
+            allowed, retry_after = self.server.app.limiter.check("other", client_key)
+            if not allowed:
+                # Parser already consumed; replace parser error with 429.
+                try:
+                    body = json.dumps({"error": "rate_limited"}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    for name, value in SECURITY_HEADERS:
+                        self.send_header(name, value)
+                    self.send_header("Link", "<{}>; rel=\"source\"".format(SOURCE_URL))
+                    self.send_header("X-Source-Revision", self.server.app.config.source_revision)
+                    self.send_header("Retry-After", str(max(1, int(math.ceil(retry_after)))))
+                    self.end_headers()
+                    if getattr(self, "command", "") != "HEAD":
+                        try:
+                            self.wfile.write(body)
+                            self._access_bytes = len(body)
+                        except (BrokenPipeError, ConnectionResetError):
+                            self._access_bytes = 0
+                except Exception:
+                    pass
+                return
+            names = {
+                400: "bad_request",
+                414: "request_uri_too_long",
+                431: "request_headers_too_large",
+                505: "http_version_not_supported",
+            }
+            self._send(int(code), {"error": names.get(int(code), "request_error")},
+                       head_only=(getattr(self, "command", "") == "HEAD"))
+            return
         if int(code) == 501 and not self._rate_allowed(self._path()):
             return
         names = {
