@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=opc
 WorkingDirectory=/home/opc/qr-harvest
-EnvironmentFile=-/etc/qr-harvest/common.env
 EnvironmentFile=/etc/qr-harvest/keeper.env
+EnvironmentFile=-/etc/qr-harvest/common.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/opc/qr-harvest/qr_keeper.py
 UMask=0077

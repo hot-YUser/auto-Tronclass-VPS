@@ -353,6 +353,110 @@ class KeeperTokenTests(unittest.TestCase):
             corpus.write("ignored")
         open_day.assert_not_called()
 
+    def test_restart_auth_loss_propagates_to_outer_lifecycle(self):
+        # _restart_rollcall must propagate AuthenticationLost so outer harvester immediately resets session.
+        saved = {k: getattr(qr_keeper, k) for k in ("WORKDIR", "CONTROL_PATH", "CONTROL_ACK_PATH", "RID_PATH")}
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            qr_keeper.WORKDIR = tmp.name
+            qr_keeper.CONTROL_PATH = str(pathlib.Path(tmp.name) / "control.json")
+            qr_keeper.CONTROL_ACK_PATH = str(pathlib.Path(tmp.name) / "control-ack.json")
+            qr_keeper.RID_PATH = str(pathlib.Path(tmp.name) / "rollcall.json")
+            req = qr_keeper._normalize_control_record({
+                "version": 1, "cmd": "restart", "request_id": "request-id-123456", "created_epoch_ms": 1})
+            with patch.object(qr_keeper, "_rollcall_in_progress", side_effect=qr_keeper.AuthenticationLost("lost")):
+                with self.assertRaises(qr_keeper.AuthenticationLost):
+                    qr_keeper._restart_rollcall(object(), "old-rid", req)
+            with patch.object(qr_keeper, "_rollcall_in_progress", return_value=False), patch.object(qr_keeper, "create_rollcall", side_effect=qr_keeper.AuthenticationLost("lost2")):
+                with self.assertRaises(qr_keeper.AuthenticationLost):
+                    qr_keeper._restart_rollcall(object(), "old-rid", req)
+        finally:
+            for k, v in saved.items():
+                setattr(qr_keeper, k, v)
+            tmp.cleanup()
+
+    def test_prune_file_not_found_accounts_once_and_perm_propagates(self):
+        import os, pathlib as pl
+        saved = {k: getattr(qr_keeper, k) for k in ("WORKDIR", "CORPUS_MAX_BYTES", "CORPUS_MAX_DAYS")}
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            qr_keeper.WORKDIR = tmp.name
+            qr_keeper.CORPUS_MAX_BYTES = 4
+            qr_keeper.CORPUS_MAX_DAYS = 30
+            today = time.strftime("%Y%m%d", time.gmtime())
+            yday = time.strftime("%Y%m%d", time.gmtime(time.time() - 86400))
+            p_today = pl.Path(tmp.name) / f"tokens-{today}.jsonl.gz"
+            p_yday = pl.Path(tmp.name) / f"tokens-{yday}.jsonl.gz"
+            p_today.write_bytes(b"x" * 8)
+            p_yday.write_bytes(b"y" * 8)
+            orig_remove = os.remove
+            def remove_side(path):
+                if str(path) == str(p_yday):
+                    raise FileNotFoundError()
+                return orig_remove(path)
+            with patch.object(os, "remove", side_effect=remove_side):
+                total = qr_keeper.Corpus()._prune()
+            # yday vanished after size captured (8 accounted exactly once), today still over -> removed -> 0
+            self.assertEqual(0, total)
+            self.assertFalse(p_today.exists())
+            # PermissionError must propagate to disable boundary, not be hidden.
+            with patch.object(os.path, "getsize", side_effect=PermissionError("perm")):
+                with self.assertRaises(PermissionError):
+                    qr_keeper.Corpus()._files()
+                with self.assertRaises(PermissionError):
+                    qr_keeper.Corpus()._prune()
+        finally:
+            for k, v in saved.items():
+                setattr(qr_keeper, k, v)
+            tmp.cleanup()
+
+    def test_corpus_metric_published_after_low_space_prune(self):
+        import os, pathlib as pl, shutil
+        saved = {k: getattr(qr_keeper, k) for k in ("WORKDIR", "CORPUS_ENABLED", "CORPUS_MAX_BYTES", "CORPUS_MAX_DAYS", "CORPUS_MIN_FREE_BYTES", "CORPUS_FLUSH_RECORDS")}
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            qr_keeper.WORKDIR = tmp.name
+            qr_keeper.CORPUS_ENABLED = True
+            qr_keeper.CORPUS_MAX_BYTES = 1024 * 1024
+            qr_keeper.CORPUS_MAX_DAYS = 30
+            qr_keeper.CORPUS_MIN_FREE_BYTES = 5 * 1024 ** 3
+            today = time.strftime("%Y%m%d", time.gmtime())
+            (pl.Path(tmp.name) / f"tokens-{today}.jsonl.gz").write_bytes(b"z" * 100)
+            qr_keeper.STATE["corpus_bytes"] = 0
+            c = qr_keeper.Corpus()
+            c.path = str(pl.Path(tmp.name) / f"tokens-{today}.jsonl.gz")
+            c.f = open(os.devnull, "w")
+            try:
+                # Free recovers after prune -> metric must be published immediately.
+                with patch.object(shutil, "disk_usage", side_effect=[
+                    shutil._ntuple_diskusage(100 * 1024 * 1024, 0, 0),
+                    shutil._ntuple_diskusage(100 * 1024 * 1024, 0, 20 * 1024 * 1024 * 1024),
+                ]), patch.object(qr_keeper.Corpus, "_prune", return_value=77):
+                    qr_keeper.STATE["corpus_bytes"] = 0
+                    c2 = qr_keeper.Corpus()
+                    c2.path = c.path
+                    c2.f = open(os.devnull, "w")
+                    c2.write('{"y":1}')
+                    self.assertEqual(77, qr_keeper.STATE.get("corpus_bytes"))
+                    c2.f.close()
+                # Free still low after prune -> metric also published but write is skipped.
+                with patch.object(shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100 * 1024 * 1024, 0, 0)),                      patch.object(qr_keeper.Corpus, "_prune", return_value=99):
+                    c3 = qr_keeper.Corpus()
+                    c3.path = c.path
+                    c3.f = open(os.devnull, "w")
+                    c3.write('{"z":1}')
+                    self.assertEqual(99, qr_keeper.STATE.get("corpus_bytes"))
+                    c3.f.close()
+            finally:
+                try:
+                    c.f.close()
+                except Exception:
+                    pass
+        finally:
+            for k, v in saved.items():
+                setattr(qr_keeper, k, v)
+            tmp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

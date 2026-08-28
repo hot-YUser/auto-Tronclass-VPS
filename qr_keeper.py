@@ -63,6 +63,14 @@ class AuthenticationLost(RuntimeError):
 
 def load_config(env: Optional[Mapping[str, str]] = None) -> KeeperConfig:
     values = os.environ if env is None else env
+    for forbidden in ("QR_API_KEY", "QR_BIND", "QR_PORT", "QR_API_WORKERS",
+                      "QR_API_PENDING", "QR_LIMITER_MAX_ENTRIES",
+                      "QR_GLOBAL_RATE", "QR_GLOBAL_BURST",
+                      "QR_PRINCIPAL_RATE", "QR_PRINCIPAL_BURST",
+                      "QR_HEALTH_RATE", "QR_HEALTH_BURST",
+                      "QR_RESTART_RATE", "QR_RESTART_BURST"):
+        if str(values.get(forbidden, "")).strip():
+            raise ConfigError("{} must not be set in keeper process".format(forbidden))
     base = env_text(values, "QR_BASE", "https://www.tronclass.com.tw", required=True).rstrip("/")
     parsed = urllib.parse.urlsplit(base)
     if parsed.scheme not in ("http", "https") or not parsed.hostname \
@@ -686,6 +694,8 @@ def _restart_rollcall(op, rid, request):
         with LOCK:
             STATE["recreated"] = STATE.get("recreated", 0) + 1
         return new_rid, {"request": request, "old_rollcall_id": old_rid}
+    except AuthenticationLost:
+        raise
     except Exception as exc:
         try:
             _write_control_ack(
@@ -732,8 +742,10 @@ class Corpus:
                 path = os.path.join(WORKDIR, filename)
                 try:
                     files.append((filename, path, os.path.getsize(path)))
-                except OSError:
+                except FileNotFoundError:
                     continue
+                except (PermissionError, OSError):
+                    raise
         return sorted(files)
 
     def _prune(self, protected_path=""):
@@ -749,6 +761,8 @@ class Corpus:
                     os.remove(path)
                 except FileNotFoundError:
                     files.remove((filename, path, _size))
+                    total = sum(size for _filename, _path, size in files)
+                    # File vanished: don't subtract from already-computed total below.
                     continue
                 except (PermissionError, OSError):
                     raise
@@ -763,6 +777,7 @@ class Corpus:
             try:
                 os.remove(path)
             except FileNotFoundError:
+                total -= size
                 files.remove(item)
                 continue
             except (PermissionError, OSError):
@@ -773,7 +788,8 @@ class Corpus:
 
     def _open_day(self):
         self.close()
-        self._prune()
+        total = self._prune()
+        _set(corpus_bytes=total)
         self.day = time.strftime("%Y%m%d", time.gmtime())
         self.path = os.path.join(WORKDIR, "tokens-{}.jsonl.gz".format(self.day))
         self.f = gzip.open(self.path, "at", encoding="utf-8")
@@ -812,6 +828,7 @@ class Corpus:
             if shutil.disk_usage(WORKDIR).free < CORPUS_MIN_FREE_BYTES:
                 _set(corpus_bytes=total)
                 return
+            _set(corpus_bytes=total)
         if self.f is None or self.day != time.strftime("%Y%m%d", time.gmtime()):
             self._open_day()
         self.f.write(line + "\n")

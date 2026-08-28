@@ -582,5 +582,64 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(200, access["status"])
 
 
+    def test_keepalive_connection_close_header_forces_close(self):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        crlf = chr(13) + chr(10)
+        wire = crlf.join(["GET /health HTTP/1.1", "Host: 127.0.0.1", "Connection: keep-alive", "", ""])
+        s.sendall(wire.encode())
+        s.settimeout(2)
+        data = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            pass
+        self.assertIn(b"Connection: close", data)
+        try:
+            wire2 = crlf.join(["GET /health HTTP/1.1", "Host: 127.0.0.1", "", ""])
+            s.sendall(wire2.encode())
+            s.settimeout(1)
+            extra = s.recv(4096)
+        except OSError:
+            extra = b""
+        self.assertEqual(b"", extra)
+        s.close()
+        status, _headers, _payload = self.json_request("GET", "/health")
+        self.assertEqual(200, status)
+
+    def test_versioned_request_not_cleared_by_nonce_alias(self):
+        self.write("control.json", {
+            "version": 1,
+            "cmd": "restart",
+            "request_id": "versioned-request-123456",
+            "created_epoch_ms": 1,
+            "nonce": "old-ack-nonce-1234567890",
+        })
+        self.write("control-ack.json", {
+            "version": 1,
+            "request_id": "old-ack-nonce-1234567890",
+            "status": "completed",
+        })
+        status, _headers, payload = self.json_request(
+            "POST", "/restart", {"Authorization": "Bearer master-secret-value-0123456789abcdef"})
+        self.assertEqual(409, status)
+        self.assertEqual({"error": "restart_pending"}, payload)
+        self.write("control-ack.json", {
+            "version": 1,
+            "request_id": "versioned-request-123456",
+            "status": "completed",
+        })
+        import qr_api as api_mod, unittest.mock as mock
+        with mock.patch.object(api_mod.secrets, "token_urlsafe", return_value="next-versioned-999999"):
+            status, _headers, payload = self.json_request(
+                "POST", "/restart", {"Authorization": "Bearer master-secret-value-0123456789abcdef"})
+        self.assertEqual(202, status)
+        self.assertEqual("next-versioned-999999", payload["request_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

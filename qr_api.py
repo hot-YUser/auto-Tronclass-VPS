@@ -77,6 +77,10 @@ class ApiConfig:
 
 def load_config(env: Optional[Mapping[str, str]] = None) -> ApiConfig:
     values = os.environ if env is None else env
+    # Managed-key isolation: API process must not receive teacher credentials.
+    for forbidden in ("QR_TEACHER_USER", "QR_TEACHER_PASS"):
+        if str(values.get(forbidden, "")).strip():
+            raise ConfigError("{} must not be set in API process".format(forbidden))
     bind = env_text(values, "QR_BIND", "127.0.0.1", required=True)
     try:
         bind_ip = ipaddress.ip_address(bind)
@@ -234,6 +238,7 @@ class ApiApplication:
         self.control_ack_path = os.path.join(config.workdir, "control-ack.json")
         self.keys_path = os.path.join(config.workdir, "apikeys.json")
         self.limiter = RequestLimiter(config, monotonic)
+        self._restart_lock = threading.Lock()
 
     @staticmethod
     def _print_log(entry):
@@ -337,22 +342,19 @@ class ApiApplication:
         if not isinstance(request, dict) or request.get("cmd") != "restart":
             return False
         version = request.get("version")
-        if version == 1:
+        if isinstance(version, int) and not isinstance(version, bool) and version == 1:
             request_id = request.get("request_id")
             if not isinstance(request_id, str) \
                     or _CONTROL_REQUEST_ID_RE.fullmatch(request_id) is None:
                 return False
+            created = request.get("created_epoch_ms")
+            if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
+                return False
             ack = _read_json(self.control_ack_path)
-            if isinstance(ack, dict) and ack.get("status") in _TERMINAL_CONTROL_STATUSES:
-                ack_id = ack.get("request_id")
-                alias = request.get("nonce")
-                if ack_id == request_id or (isinstance(alias, str) and ack_id == alias):
-                    return False
-            return not (
-                isinstance(ack, dict)
-                and ack.get("request_id") == request_id
-                and ack.get("status") in _TERMINAL_CONTROL_STATUSES
-            )
+            if isinstance(ack, dict) and ack.get("status") in _TERMINAL_CONTROL_STATUSES \
+                    and ack.get("request_id") == request_id:
+                return False
+            return True
         if version is None:
             nonce = request.get("nonce")
             if not isinstance(nonce, str) or self.LEGACY_NONCE_RE.fullmatch(nonce) is None:
@@ -365,27 +367,28 @@ class ApiApplication:
             )
         return False
     def request_restart(self):
-        state = _read_json(self.state_path)
-        if isinstance(state, dict) and state.get("preserve") is True:
-            return 409, {"error": "preserve_active"}
-        if self._restart_is_pending():
-            return 409, {"error": "restart_pending"}
-        request_id = secrets.token_urlsafe(18)
-        now = self.now_ms()
-        request = {
-            "version": 1,
-            "cmd": "restart",
-            "request_id": request_id,
-            "created_epoch_ms": now,
-            # Compat: include legacy nonce alias so an old keeper (nonce-only) can still restart.
-            "nonce": str(now),
-        }
-        write_json_atomic(
-            self.control_path,
-            request,
-            durable=True,
-            separators=(",", ":"),
-        )
+        with self._restart_lock:
+            state = _read_json(self.state_path)
+            if isinstance(state, dict) and state.get("preserve") is True:
+                return 409, {"error": "preserve_active"}
+            if self._restart_is_pending():
+                return 409, {"error": "restart_pending"}
+            request_id = secrets.token_urlsafe(18)
+            now = self.now_ms()
+            request = {
+                "version": 1,
+                "cmd": "restart",
+                "request_id": request_id,
+                "created_epoch_ms": now,
+                # Compat: include legacy nonce alias so an old keeper (nonce-only) can still restart.
+                "nonce": str(now),
+            }
+            write_json_atomic(
+                self.control_path,
+                request,
+                durable=True,
+                separators=(",", ":"),
+            )
         return 202, {
             "ok": True,
             "status": "accepted",
@@ -486,6 +489,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_headers(self, status, content_length, extra_headers=None,
                       content_type=None):
+        self.close_connection = True
         self.send_response(status)
         if content_type is not None:
             self.send_header("Content-Type", content_type)
@@ -525,6 +529,7 @@ class Handler(BaseHTTPRequestHandler):
             allowed, retry_after = self.server.app.limiter.check("other", client_key)
             if not allowed:
                 # Parser already consumed; replace parser error with 429.
+                self.close_connection = True
                 try:
                     body = json.dumps({"error": "rate_limited"}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     self.send_response(429)
