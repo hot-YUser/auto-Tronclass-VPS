@@ -1,5 +1,5 @@
 [Unit]
-Description=TronClass QR keeper (session + rollcall + token harvest)
+Description=TronClass QR keeper (teacher session + rollcall + token harvest)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,8 +7,36 @@ Wants=network-online.target
 Type=simple
 User=opc
 WorkingDirectory=/home/opc/qr-harvest
-EnvironmentFile=/etc/qr-harvest/secrets.env
+EnvironmentFile=/etc/qr-harvest/keeper.env
+EnvironmentFile=-/etc/qr-harvest/common.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/opc/qr-harvest/qr_keeper.py
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/opc/qr-harvest
+ReadOnlyPaths=/home/opc/qr-harvest/qr_api.py /home/opc/qr-harvest/qr_keeper.py /home/opc/qr-harvest/qr_keys.py /home/opc/qr-harvest/qr_common.py
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RemoveIPC=true
+TasksMax=64
+MemoryMax=256M
+LimitNOFILE=1024
+TimeoutStopSec=30
 Restart=always
 RestartSec=10
 StandardOutput=journal

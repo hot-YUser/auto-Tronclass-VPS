@@ -1,4 +1,7 @@
 secrets.env
+api.env
+keeper.env
+common.env
 __pycache__/
 *.pyc
 
@@ -8,8 +11,10 @@ cookies-student.txt
 token.json
 state.json
 control.json
+control-ack.json
 rollcall.json
 apikeys.json
+apikeys.json.lock
 tokens-*.jsonl.gz
 *.tmp
 
