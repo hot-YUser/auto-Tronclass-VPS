@@ -107,7 +107,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ApiConfig:
         stale_ms=env_int(values, "QR_STALE_MS", 3000, minimum=1),
         future_skew_ms=env_int(values, "QR_FUTURE_SKEW_MS", 1000, minimum=0),
         workdir=workdir,
-        workers=env_int(values, "QR_API_WORKERS", 4, minimum=1, maximum=64),
+        # TasksMax=64 budget: at most 60 workers plus the main-thread task, keeping a small margin.
+        workers=env_int(values, "QR_API_WORKERS", 4, minimum=1, maximum=60),
         pending=env_int(values, "QR_API_PENDING", 16, minimum=1, maximum=1024),
         socket_timeout_seconds=env_float(
             values, "QR_SOCKET_TIMEOUT_SECONDS", 10.0,
@@ -336,7 +337,7 @@ class ApiApplication:
             "age_ms": checked.age_ms,
         }
 
-    LEGACY_NONCE_RE = __import__("re").compile(r"[0-9]{10,15}\Z")
+    LEGACY_NONCE_RE = re.compile(r"[0-9]{10,15}\Z")
     def _restart_is_pending(self):
         request = _read_json(self.control_path)
         if not isinstance(request, dict) or request.get("cmd") != "restart":

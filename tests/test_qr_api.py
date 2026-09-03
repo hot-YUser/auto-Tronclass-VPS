@@ -221,6 +221,17 @@ class ApiConfigTests(unittest.TestCase):
         env["QR_API_KEY"] = ""
         self.assertEqual("", qr_api.load_config(env).api_key)
 
+    def test_workers_maximum_fits_tasks_max_with_margin(self):
+        # qr-api.service TasksMax=64: 1 main thread + 60 executor workers
+        # = 61 tasks, leaving 3 spare for transient spawn overlap.
+        env = api_env("/tmp/qr-api")
+        env["QR_API_WORKERS"] = "60"
+        self.assertEqual(60, qr_api.load_config(env).workers)
+        env = api_env("/tmp/qr-api")
+        env["QR_API_WORKERS"] = "61"
+        with self.assertRaises(ConfigError):
+            qr_api.load_config(env)
+
 
 class ApiServerTests(unittest.TestCase):
     NOW = 2_000_000_000.5
@@ -639,6 +650,106 @@ class ApiServerTests(unittest.TestCase):
                 "POST", "/restart", {"Authorization": "Bearer master-secret-value-0123456789abcdef"})
         self.assertEqual(202, status)
         self.assertEqual("next-versioned-999999", payload["request_id"])
+
+
+class SyntheticMeasurementTests(unittest.TestCase):
+    """Stdlib-only synthetic loopback measurement; reports timings, asserts only semantics.
+
+    Reuses api_env()/make_server() with temporary synthetic fixtures. Elapsed
+    times and RSS are printed for operators only; no test asserts any timing
+    or memory threshold, and no real key or upstream is touched.
+    """
+
+    NOW = 2_000_000_000.5
+    DATA = "2000000000" + "a" * 32
+
+    def test_loopback_health_and_token_report_only(self):
+        import tracemalloc
+
+        try:
+            import resource
+        except ImportError:
+            # POSIX-only; Windows CI reports tracemalloc + timings instead.
+            resource = None
+
+        temp = tempfile.TemporaryDirectory()
+        try:
+            root = pathlib.Path(temp.name)
+            (root / "state.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+            (root / "token.json").write_text(json.dumps({
+                "ok": True,
+                "data": self.DATA,
+                "ts": 2_000_000_000,
+                "fetched_at_utc": "2033-05-18T03:33:20Z",
+                "rollcall_id": "r1",
+            }), encoding="utf-8")
+
+            start = time.perf_counter()
+            config = qr_api.load_config(api_env(temp.name))
+            server = qr_api.make_server(
+                config, ("127.0.0.1", 0), wall_clock=lambda: self.NOW,
+                monotonic=time.monotonic, log_sink=lambda entry: None)
+            import_ms = (time.perf_counter() - start) * 1000
+            try:
+                if resource is None:
+                    rss_line = "max-rss=unavailable-on-this-platform"
+                else:
+                    try:
+                        rss_kb = resource.getrusage(
+                            resource.RUSAGE_SELF).ru_maxrss
+                        rss_line = "max-rss={}KB".format(rss_kb)
+                    except Exception:
+                        rss_line = "max-rss=unavailable-on-this-platform"
+
+                tracemalloc.start()
+                thread = threading.Thread(
+                    target=server.serve_forever, daemon=True)
+                thread.start()
+                port = server.server_address[1]
+                begun_ms = (time.perf_counter() - start) * 1000
+
+                def timed(method, path, headers=None):
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", port, timeout=5)
+                    begun = time.perf_counter()
+                    conn.request(method, path, headers=headers or {})
+                    response = conn.getresponse()
+                    raw = response.read()
+                    elapsed_ms = (time.perf_counter() - begun) * 1000
+                    result = (response.status, raw)
+                    conn.close()
+                    return result, elapsed_ms
+
+                (health_status, health_raw), health_ms = timed("GET", "/health")
+                (token_status, token_raw), token_ms = timed(
+                    "GET", "/token",
+                    {"Authorization": "Bearer master-secret-value-0123456789abcdef"})
+
+                current, peak = tracemalloc.get_traced_memory()
+                print(
+                    "synthetic-measurement import_ms={:.1f} startup_ms={:.1f} "
+                    "health_ms={:.1f} token_ms={:.1f} {} "
+                    "tracemalloc_current={}B peak={}B".format(
+                        import_ms, begun_ms, health_ms, token_ms,
+                        rss_line, current, peak),
+                    flush=True)
+
+                self.assertEqual(200, health_status)
+                health = json.loads(health_raw.decode("utf-8"))
+                self.assertEqual(
+                    {"ok", "status", "token_fresh", "token_age_ms"},
+                    set(health))
+                self.assertEqual(200, token_status)
+                token = json.loads(token_raw.decode("utf-8"))
+                self.assertTrue(token["ok"])
+                self.assertEqual(self.DATA, token["data"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(2)
+                tracemalloc.stop()
+        finally:
+            temp.cleanup()
 
 
 if __name__ == "__main__":

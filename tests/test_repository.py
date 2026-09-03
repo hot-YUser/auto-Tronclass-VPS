@@ -176,6 +176,36 @@ class RepositoryHygieneTests(unittest.TestCase):
         cfg_new = qr_keeper.load_config(merged)
         self.assertEqual(3000, cfg_new.stale_ms)
 
+    def test_api_workers_maximum_fits_service_tasks_max(self):
+        # Worst case: 1 main thread + QR_API_WORKERS executor threads must stay
+        # under qr-api.service TasksMax. Re-derive both bounds from tracked
+        # sources so a future bump of either side breaks loudly here too.
+        import re
+        import sys
+        sys.path.insert(0, str(ROOT))
+        import qr_api
+        source = (ROOT / "qr_api.py").read_text(encoding="utf-8")
+        match = re.search(
+            r'workers=env_int\(values,\s*"QR_API_WORKERS",\s*\d+,'
+            r"\s*minimum=\d+,\s*maximum=(\d+)\)", source)
+        self.assertIsNotNone(match, "QR_API_WORKERS bound not found in qr_api.py")
+        maximum = int(match.group(1))
+        unit = (ROOT / "qr-api.service").read_text(encoding="utf-8")
+        tasks_max = int(next(
+            line.split("=", 1)[1].strip()
+            for line in unit.splitlines()
+            if line.strip().startswith("TasksMax=")))
+        self.assertLessEqual(1 + maximum, tasks_max - 1,
+                             "need 1 main + workers + 1 spare within TasksMax")
+        from qr_common import ConfigError
+        from tests.test_qr_api import api_env
+        env = api_env("/tmp/qr-api-tasksmax")
+        env["QR_API_WORKERS"] = str(maximum)
+        self.assertEqual(maximum, qr_api.load_config(env).workers)
+        env["QR_API_WORKERS"] = str(maximum + 1)
+        with self.assertRaises(ConfigError):
+            qr_api.load_config(env)
+
 
 if __name__ == "__main__":
     unittest.main()
