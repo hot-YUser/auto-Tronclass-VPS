@@ -458,5 +458,45 @@ class KeeperTokenTests(unittest.TestCase):
             tmp.cleanup()
 
 
+class KeeperLadderEvaluationTests(unittest.TestCase):
+    def test_duration_ladder_characterization(self):
+        # Characterization only: record the current ladder shape so any head
+        # change breaks loudly here and forces an evidence-backed review.
+        # No accepted replacement value exists yet; this test must not be
+        # edited to bless a new head without that evidence.
+        import re
+        source = (ROOT / "qr_keeper.py").read_text(encoding="utf-8")
+        match = re.search(
+            r"def _duration_ladder\(\):\n((?: +.*\n)+?)\n",
+            source)
+        self.assertIsNotNone(match, "ladder body not found")
+        body = match.group(1)
+        self.assertIn("_ROLLCALL_DURATION_ENV", body)
+        tail = tuple(int(part) for part in re.findall(r"\d+", body.split("return", 1)[1]))
+        self.assertEqual(
+            (3153600000, 31536000, 2592000, 86400, 7200, 0), tail,
+            "ladder tail changed; review the head change with live evidence")
+        head = body.split("return", 1)[1].split("(", 1)[1].split(",", 1)[0].strip()
+        self.assertTrue(
+            head in ("top",) or head.isdigit(),
+            "ladder head must stay env-derived or a reviewed literal")
+
+    def test_stop_event_is_process_wide_shutdown_signal(self):
+        # Characterization only: STOP_EVENT must remain a single module-level
+        # threading.Event shared by every worker loop; a per-thread or
+        # renamed signal would strand workers on shutdown.
+        import threading
+        self.assertIsInstance(qr_keeper.STOP_EVENT, threading.Event)
+        source = (ROOT / "qr_keeper.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            1, source.count("STOP_EVENT = threading.Event()"),
+            "exactly one process-wide STOP_EVENT must exist")
+        for loop in ("def harvester():", "def passive_check():", "def state_writer():"):
+            start = source.index(loop)
+            segment = source[start:start + 4000]
+            self.assertIn("STOP_EVENT", segment,
+                          "{} must observe the process-wide STOP_EVENT".format(loop))
+
+
 if __name__ == "__main__":
     unittest.main()
